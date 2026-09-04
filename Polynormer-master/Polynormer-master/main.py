@@ -1,3 +1,5 @@
+import os
+import time
 import argparse
 import random
 import numpy as np
@@ -11,6 +13,7 @@ from dataset import load_dataset
 from data_utils import eval_acc, eval_rocauc, load_fixed_splits
 from eval import *
 from parse import parse_method, parser_add_main_args
+from node_level_rasterizer import node_to_ego_map
 
 
 def fix_seed(seed=42):
@@ -22,125 +25,225 @@ def fix_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-### Parse args ###
-parser = argparse.ArgumentParser(description='Training Pipeline for Node Classification')
-parser_add_main_args(parser)
-args = parser.parse_args()
-if not args.global_dropout:
-    args.global_dropout = args.dropout
-print(args)
 
-fix_seed(args.seed)
+def get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args):
+    """
+    Check for pre-rasterized 4-channel continuous Ego-Maps cache on disk.
+    If missing, rasterizes all nodes using bounded ego-subgraphs and caches as uint8.
+    """
+    n = dataset.graph['num_nodes']
+    cache_dir = os.path.join(args.data_dir, "ego_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(
+        cache_dir,
+        f"{args.dataset}_res{args.resolution}_hops{args.num_hops}_max{args.max_nodes}_{args.layout_method}.pt"
+    )
 
-if args.cpu:
-    device = torch.device("cpu")
-else:
-    device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
+    if os.path.exists(cache_file):
+        print(f"Loading pre-computed Ego-Map cache from: {cache_file} ...")
+        t0 = time.time()
+        cached_maps = torch.load(cache_file)
+        print(f"Loaded {cached_maps.shape[0]} Ego-Maps in {time.time() - t0:.2f}s | Tensor: {list(cached_maps.shape)} ({cached_maps.dtype})")
+        return cached_maps
 
-### Load and preprocess data ###
-dataset = load_dataset(args.data_dir, args.dataset)
+    print(f"\n{'='*75}")
+    print(f"Pre-rasterizing {n} continuous 4-channel Ego-Maps for '{args.dataset}'")
+    print(f"Resolution: {args.resolution}x{args.resolution} | Hops: {args.num_hops} | Max Nodes: {args.max_nodes} | Layout: '{args.layout_method}'")
+    print(f"Cache will be saved to: {cache_file}")
+    print(f"{'='*75}")
 
-if len(dataset.label.shape) == 1:
-    dataset.label = dataset.label.unsqueeze(1)
-dataset.label = dataset.label.to(device)
+    cached_maps = torch.empty((n, 4, args.resolution, args.resolution), dtype=torch.uint8)
+    t0 = time.time()
 
-split_idx_lst = load_fixed_splits(args.data_dir, dataset, name=args.dataset)
+    for i in range(n):
+        map_tensor = node_to_ego_map(
+            target_node=i,
+            edge_index=edge_index_cpu,
+            x=x_cpu,
+            num_hops=args.num_hops,
+            resolution=args.resolution,
+            sigma_node=0.08,
+            sigma_edge=0.035,
+            max_nodes=args.max_nodes,
+            layout_method=args.layout_method,
+            seed=args.seed + i
+        )
+        # Store as uint8 (0-255) to reduce RAM / disk size by 4x
+        cached_maps[i] = (map_tensor * 255.0).clamp(0, 255).to(torch.uint8)
 
-### Basic information of datasets ###
-n = dataset.graph['num_nodes']
-e = dataset.graph['edge_index'].shape[1]
-c = max(dataset.label.max().item() + 1, dataset.label.shape[1])
-d = dataset.graph['node_feat'].shape[1]
+        if (i + 1) % 1000 == 0 or (i + 1) == n:
+            elapsed = time.time() - t0
+            rate = (i + 1) / max(elapsed, 0.001)
+            eta_sec = (n - (i + 1)) / max(rate, 0.001)
+            print(f"  Rasterized {i + 1:5d}/{n:5d} nodes ({((i+1)/n)*100:.1f}%) | Speed: {rate:.1f} nodes/sec | ETA: {eta_sec:.1f}s")
 
-print(f"dataset {args.dataset} | num nodes {n} | num edge {e} | num node feats {d} | num classes {c}")
+    # Save to disk
+    torch.save(cached_maps, cache_file)
+    size_mb = (cached_maps.element_size() * cached_maps.nelement()) / (1024 * 1024)
+    print(f"Rasterization caching complete! Saved {size_mb:.1f} MB to: {cache_file}\n")
+    return cached_maps
 
-dataset.graph['edge_index'] = to_undirected(dataset.graph['edge_index'])
-dataset.graph['edge_index'], _ = remove_self_loops(dataset.graph['edge_index'])
-dataset.graph['edge_index'], _ = add_self_loops(dataset.graph['edge_index'], num_nodes=n)
 
-dataset.graph['edge_index'], dataset.graph['node_feat'] = \
-    dataset.graph['edge_index'].to(device), dataset.graph['node_feat'].to(device)
+@torch.no_grad()
+def predict_all_nodes(model, cached_maps, node_feat, args, device):
+    """
+    Compute node-level predictions in mini-batches of nodes (e.g. 256 nodes per batch)
+    to get class logits for every node in the dataset.
+    """
+    model.eval()
+    all_out = []
+    n_nodes = cached_maps.size(0)
+    batch_size = args.eval_batch_size
 
-### Load method ###
-model = parse_method(args, n, c, d, device)
+    for b_start in range(0, n_nodes, batch_size):
+        b_idx = torch.arange(b_start, min(b_start + batch_size, n_nodes))
+        b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
+        b_feats = node_feat[b_idx] if (node_feat is not None and not args.no_node_features) else None
+        logits = model(b_maps, b_feats)
+        all_out.append(logits.cpu())
 
-### Loss function (Single-class, Multi-class) ###
-if args.dataset in ('questions'):
-    criterion = nn.BCEWithLogitsLoss()
-else:
-    criterion = nn.NLLLoss()
+    return torch.cat(all_out, dim=0).to(device)
 
-### Performance metric (Acc, AUC) ###
-if args.metric == 'rocauc':
-    eval_func = eval_rocauc
-else:
-    eval_func = eval_acc
 
-logger = Logger(args.runs, args)
+def main():
+    ### Parse args ###
+    parser = argparse.ArgumentParser(description='Graph2Map Training Pipeline for Node Classification')
+    parser_add_main_args(parser)
+    args = parser.parse_args()
+    print(args)
 
-model.train()
-print('MODEL:', model)
+    fix_seed(args.seed)
 
-### Training loop ###
-for run in range(args.runs):
-    if args.dataset in ('coauthor-cs', 'coauthor-physics', 'amazon-computer', 'amazon-photo'):
-        split_idx = split_idx_lst[0]
+    if args.cpu:
+        device = torch.device("cpu")
     else:
-        split_idx = split_idx_lst[run]
-    train_idx = split_idx['train'].to(device)
-    model.reset_parameters()
-    model._global = False
-    optimizer = torch.optim.Adam(model.parameters(),weight_decay=args.weight_decay, lr=args.lr)
-    best_val = float('-inf')
-    best_test = float('-inf')
-    if args.save_model:
-        save_model(args, model, optimizer, run)
+        device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
 
-    for epoch in range(args.local_epochs+args.global_epochs):
-        if epoch == args.local_epochs:
-            print("start global attention!!!!!!")
-            if args.save_model:
-                model, optimizer = load_model(args, model, optimizer, run)
-            model._global = True
-        model.train()
-        optimizer.zero_grad()
+    ### Load dataset via Polynormer dataset loader ###
+    dataset = load_dataset(args.data_dir, args.dataset)
 
-        out = model(dataset.graph['node_feat'], dataset.graph['edge_index'])
-        if args.dataset in ('questions'):
-            if dataset.label.shape[1] == 1:
-                true_label = F.one_hot(dataset.label, dataset.label.max() + 1).squeeze(1)
-            else:
-                true_label = dataset.label
-            loss = criterion(out[train_idx], true_label.squeeze(1)[
-                train_idx].to(torch.float))
+    if len(dataset.label.shape) == 1:
+        dataset.label = dataset.label.unsqueeze(1)
+    dataset.label = dataset.label.to(device)
+
+    split_idx_lst = load_fixed_splits(args.data_dir, dataset, name=args.dataset)
+
+    ### Dataset information ###
+    n = dataset.graph['num_nodes']
+    e = dataset.graph['edge_index'].shape[1]
+    c = max(dataset.label.max().item() + 1, dataset.label.shape[1])
+    d = dataset.graph['node_feat'].shape[1] if dataset.graph['node_feat'] is not None else 0
+
+    print(f"Dataset: {args.dataset} | Nodes: {n} | Directed Edges: {e} | Undirected: {e//2} | Feats: {d} | Classes: {c}")
+
+    # Ensure undirected and standard graph representation on CPU for rasterization
+    dataset.graph['edge_index'] = to_undirected(dataset.graph['edge_index'])
+    dataset.graph['edge_index'], _ = remove_self_loops(dataset.graph['edge_index'])
+
+    edge_index_cpu = dataset.graph['edge_index'].cpu()
+    x_cpu = dataset.graph['node_feat'].cpu() if dataset.graph['node_feat'] is not None else None
+
+    # Pre-rasterize / load cached Ego-Maps
+    cached_maps = get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args)
+
+    # Move node features to device for training
+    if dataset.graph['node_feat'] is not None:
+        dataset.graph['node_feat'] = dataset.graph['node_feat'].to(device)
+
+    ### Instantiate Graph2Map Vision Classifier ###
+    model = parse_method(args, n, c, d, device)
+
+    ### Loss function (Single-class, Multi-class) ###
+    if args.dataset in ('questions'):
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        criterion = nn.NLLLoss()
+
+    ### Performance metric (Acc, AUC) ###
+    if args.metric == 'rocauc':
+        eval_func = eval_rocauc
+    else:
+        eval_func = eval_acc
+
+    logger = Logger(args.runs, args)
+    print('\nMODEL ARCHITECTURE:', model)
+
+    total_epochs = args.epochs if args.epochs > 0 else (args.local_epochs + args.global_epochs)
+
+    ### Training loop ###
+    for run in range(args.runs):
+        if args.dataset in ('coauthor-cs', 'coauthor-physics', 'amazon-computer', 'amazon-photo'):
+            split_idx = split_idx_lst[0]
         else:
-            out = F.log_softmax(out, dim=1)
-            loss = criterion(
-                out[train_idx], dataset.label.squeeze(1)[train_idx])
-        loss.backward()
-        optimizer.step()
+            split_idx = split_idx_lst[run]
 
-        result = evaluate(model, dataset, split_idx, eval_func, criterion, args)
+        train_idx = split_idx['train']
+        model.reset_parameters()
+        optimizer = torch.optim.Adam(model.parameters(), weight_decay=args.weight_decay, lr=args.lr)
+        best_val = float('-inf')
+        best_test = float('-inf')
 
-        logger.add_result(run, result[:-1])
+        print(f"\n--- Starting Run {run + 1}/{args.runs} ---")
 
-        if result[1] > best_val:
-            best_val = result[1]
-            best_test = result[2]
-            if args.save_model:
-                save_model(args, model, optimizer, run)
+        for epoch in range(total_epochs):
+            model.train()
+            perm = torch.randperm(len(train_idx))
+            shuffled_train = train_idx[perm]
+            total_loss = 0.0
 
-        if epoch % args.display_step == 0:
-            print(f'Epoch: {epoch:02d}, '
-                  f'Loss: {loss:.4f}, '
-                  f'Train: {100 * result[0]:.2f}%, '
-                  f'Valid: {100 * result[1]:.2f}%, '
-                  f'Test: {100 * result[2]:.2f}%, '
-                  f'Best Valid: {100 * best_val:.2f}%, '
-                  f'Best Test: {100 * best_test:.2f}%')
-    logger.print_statistics(run)
+            # Mini-batch training over target nodes
+            for b_start in range(0, len(shuffled_train), args.batch_size):
+                b_idx = shuffled_train[b_start:b_start + args.batch_size]
+                b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
+                b_feats = dataset.graph['node_feat'][b_idx] if not args.no_node_features else None
+                b_targets = dataset.label.squeeze(1)[b_idx.to(device)]
 
-results = logger.print_statistics()
-### Save results ###
-save_result(args, results)
+                optimizer.zero_grad()
+                out_batch = model(b_maps, b_feats)
 
+                if args.dataset in ('questions'):
+                    if dataset.label.shape[1] == 1:
+                        true_label = F.one_hot(b_targets, dataset.label.max() + 1).squeeze(1)
+                    else:
+                        true_label = b_targets
+                    loss = criterion(out_batch, true_label.to(torch.float))
+                else:
+                    log_probs = F.log_softmax(out_batch, dim=1)
+                    loss = criterion(log_probs, b_targets)
+
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item() * len(b_idx)
+
+            epoch_loss = total_loss / len(train_idx)
+
+            # Evaluate node predictions across train, valid, test splits using eval.py
+            out_full = predict_all_nodes(model, cached_maps, dataset.graph['node_feat'], args, device)
+            result = evaluate(model, dataset, split_idx, eval_func, criterion, args, result=out_full)
+
+            logger.add_result(run, result[:-1])
+
+            if result[1] > best_val:
+                best_val = result[1]
+                best_test = result[2]
+                if args.save_model:
+                    save_model(args, model, optimizer, run)
+
+            if epoch % args.display_step == 0:
+                print(f'Epoch: {epoch:02d}, '
+                      f'Loss: {epoch_loss:.4f}, '
+                      f'Train: {100 * result[0]:.2f}%, '
+                      f'Valid: {100 * result[1]:.2f}%, '
+                      f'Test: {100 * result[2]:.2f}%, '
+                      f'Best Valid: {100 * best_val:.2f}%, '
+                      f'Best Test: {100 * best_test:.2f}%')
+
+        logger.print_statistics(run)
+
+    results = logger.print_statistics()
+    ### Save results ###
+    save_result(args, results)
+
+
+if __name__ == "__main__":
+    main()
