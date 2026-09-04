@@ -1,33 +1,36 @@
-# Datasets
-data/
-*.zip
-*.tar.gz
-
-# Caches and Saved Tensors
-cache_maps/
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# PyTorch weights, checkpoints, and raster caches
 *.pt
 *.pth
-.cache/
-*.cache
-benchmark_results.json
-
-# Image outputs
-maps_output/
-*.png
-*.jpg
-*.jpeg
-*.svg
-*.gif
-*.webp
-
-# Markdown files
+*.pkl
+ego_cache/
+**/ego_cache/
+ego_maps_output/
+models/
+**/models/
 *.md
 
-# IDE and OS
+# Datasets
+**/data/
+!**/data/.gitkeep
+
+# Sample exports / PNGs
+*.png
+!results/amazon-photo_ego_map_sample.png
+
+# Environments & IDE
+.env
+.venv
+env/
+venv/
 .vscode/
 .idea/
-.DS_Store
+
+# OS artifacts
 Thumbs.db
+Desktop.ini
+.DS_Store
