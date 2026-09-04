@@ -21,7 +21,7 @@ except ImportError:
 
 class LightEgoNet(nn.Module):
     """
-    Compact, specialized 2D CNN backbone tailored for 128x128 4-channel continuous Ego-Maps.
+    Compact, specialized 2D CNN backbone tailored for 128x128 multi-channel continuous + canonical Ego-Maps.
     Keeps parameter counts in the ~100k - ~580k range (matching standard Graph Neural Network
     parameter budgets) to eliminate overfitting on graph benchmark datasets.
     """
@@ -241,6 +241,7 @@ class Graph2MapClassifier(nn.Module):
 
 def create_vision_model(
     num_classes: int,
+    in_chans: int = 4,
     node_feat_dim: int = 0,
     backbone_name: str = "egocnn",
     pretrained: bool = False,
@@ -253,7 +254,7 @@ def create_vision_model(
     """
     return Graph2MapClassifier(
         num_classes=num_classes,
-        in_chans=4,
+        in_chans=in_chans,
         backbone_name=backbone_name,
         pretrained=pretrained,
         node_feat_dim=node_feat_dim,

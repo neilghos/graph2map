@@ -14,7 +14,7 @@ from dataset import load_dataset
 from data_utils import eval_acc, eval_rocauc, load_fixed_splits
 from eval import *
 from parse import parse_method, parser_add_main_args
-from node_level_rasterizer import node_to_ego_map
+from node_level_rasterizer import node_to_ego_map, save_ego_map_panel
 
 
 def fix_seed(seed=42):
@@ -29,15 +29,17 @@ def fix_seed(seed=42):
 
 def get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args):
     """
-    Check for pre-rasterized 4-channel continuous Ego-Maps cache on disk.
+    Check for pre-rasterized multi-channel Ego-Maps cache on disk.
     If missing, rasterizes all nodes using bounded ego-subgraphs and caches as uint8.
     """
     n = dataset.graph['num_nodes']
     cache_dir = os.path.join(args.data_dir, "ego_cache")
     os.makedirs(cache_dir, exist_ok=True)
+    ch_tag = f"ch{args.channels}_topo"
+    bg_tag = "darkbg" if getattr(args, 'dark_bg', False) else "whitebg"
     cache_file = os.path.join(
         cache_dir,
-        f"{args.dataset}_res{args.resolution}_hops{args.num_hops}_max{args.max_nodes}_{args.layout_method}.pt"
+        f"{args.dataset}_res{args.resolution}_hops{args.num_hops}_max{args.max_nodes}_{args.layout_method}_{ch_tag}_{bg_tag}.pt"
     )
 
     if os.path.exists(cache_file):
@@ -48,13 +50,16 @@ def get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args):
         return cached_maps
 
     print(f"\n{'='*75}")
-    print(f"Pre-rasterizing {n} continuous 4-channel Ego-Maps for '{args.dataset}'")
-    print(f"Resolution: {args.resolution}x{args.resolution} | Hops: {args.num_hops} | Max Nodes: {args.max_nodes} | Layout: '{args.layout_method}'")
+    print(f"Pre-rasterizing {n} multi-channel ({args.channels}ch) Ego-Maps for '{args.dataset}'")
+    print(f"Channels: {args.channels} | White-Anchored: {not getattr(args, 'dark_bg', False)} | Resolution: {args.resolution}x{args.resolution} | Hops: {args.num_hops}")
     print(f"Cache will be saved to: {cache_file}")
     print(f"{'='*75}")
 
-    cached_maps = torch.empty((n, 4, args.resolution, args.resolution), dtype=torch.uint8)
+    cached_maps = torch.empty((n, args.channels, args.resolution, args.resolution), dtype=torch.uint8)
     t0 = time.time()
+
+    include_canonical = (args.channels == 8)
+    white_bg = not getattr(args, 'dark_bg', False)
 
     pbar = tqdm(range(n), desc=f"Rasterizing [{args.dataset}]", unit="node", dynamic_ncols=True)
     for i in pbar:
@@ -64,10 +69,12 @@ def get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args):
             x=x_cpu,
             num_hops=args.num_hops,
             resolution=args.resolution,
-            sigma_node=0.08,
-            sigma_edge=0.035,
+            sigma_node=0.05,
+            sigma_edge=0.02,
             max_nodes=args.max_nodes,
             layout_method=args.layout_method,
+            include_canonical_matrices=include_canonical,
+            white_bg=white_bg,
             seed=args.seed + i
         )
         # Store as uint8 (0-255) to reduce RAM / disk size by 4x
@@ -77,6 +84,18 @@ def get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args):
     torch.save(cached_maps, cache_file)
     size_mb = (cached_maps.element_size() * cached_maps.nelement()) / (1024 * 1024)
     print(f"\nRasterization caching complete in {time.time() - t0:.2f}s! Saved {size_mb:.1f} MB to: {cache_file}\n")
+
+    # Save a publication-grade sample visualization panel of Node 0
+    try:
+        results_dir = "./results"
+        os.makedirs(results_dir, exist_ok=True)
+        sample_path = os.path.join(results_dir, f"{args.dataset}_ego_map_sample.png")
+        sample_tensor = (cached_maps[0].float()) / 255.0
+        label_val = int(dataset.label[0].item()) if hasattr(dataset, 'label') else None
+        save_ego_map_panel(sample_tensor, sample_path, target_node_id=0, label=label_val, split_name="sample")
+    except Exception as e:
+        print(f"Note: Could not save sample panel: {e}")
+
     return cached_maps
 
 
@@ -142,8 +161,28 @@ def main():
     # Pre-rasterize / load cached Ego-Maps
     cached_maps = get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args)
 
-    # Move node features to device for training
+    # Move node features to device for training and apply polynomial graph smoothing if enabled
     if dataset.graph['node_feat'] is not None:
+        if not getattr(args, 'no_smooth_features', False) and args.beta > 0:
+            print(f"Applying Polynomial Graph Feature Smoothing (beta={args.beta}) ...")
+            edge_index = dataset.graph['edge_index']
+            num_nodes = dataset.graph['num_nodes']
+            x = dataset.graph['node_feat']
+
+            # Symmetric normalized adjacency: D^{-1/2} (A + I) D^{-1/2}
+            edge_index_loop, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+            row, col = edge_index_loop[0], edge_index_loop[1]
+            deg = torch.bincount(row, minlength=num_nodes).float()
+            deg_inv_sqrt = torch.pow(deg, -0.5)
+            deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
+
+            val = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+            adj_norm = torch.sparse_coo_tensor(edge_index_loop, val, (num_nodes, num_nodes))
+            x_smooth = torch.sparse.mm(adj_norm, x)
+
+            dataset.graph['node_feat'] = (1.0 - args.beta) * x + args.beta * x_smooth
+            print(f"-> Node features successfully regularized with local neighborhood consensus!")
+
         dataset.graph['node_feat'] = dataset.graph['node_feat'].to(device)
 
     ### Instantiate Graph2Map Vision Classifier ###
