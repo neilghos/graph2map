@@ -174,14 +174,17 @@ def main():
             row, col = edge_index_loop[0], edge_index_loop[1]
             deg = torch.bincount(row, minlength=num_nodes).float()
             deg_inv_sqrt = torch.pow(deg, -0.5)
-            deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
-
             val = deg_inv_sqrt[row] * deg_inv_sqrt[col]
             adj_norm = torch.sparse_coo_tensor(edge_index_loop, val, (num_nodes, num_nodes))
-            x_smooth = torch.sparse.mm(adj_norm, x)
 
-            dataset.graph['node_feat'] = (1.0 - args.beta) * x + args.beta * x_smooth
-            print(f"-> Node features successfully regularized with local neighborhood consensus!")
+            # Multi-step Polynomial Diffusion across local_layers (matching Polynormer's local receptive field)
+            num_steps = getattr(args, 'local_layers', 7)
+            print(f"Applying {num_steps}-step Polynomial Graph Feature Diffusion (beta={args.beta}) ...")
+            x_curr = x.clone()
+            for step in range(num_steps):
+                x_curr = (1.0 - args.beta) * x + args.beta * torch.sparse.mm(adj_norm, x_curr)
+            dataset.graph['node_feat'] = x_curr
+            print(f"-> Node features regularized with {num_steps}-step polynomial neighborhood consensus!")
 
         dataset.graph['node_feat'] = dataset.graph['node_feat'].to(device)
 
