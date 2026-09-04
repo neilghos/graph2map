@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 from torch_geometric.utils import to_undirected, remove_self_loops, add_self_loops
 
 from logger import *
@@ -55,7 +56,8 @@ def get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args):
     cached_maps = torch.empty((n, 4, args.resolution, args.resolution), dtype=torch.uint8)
     t0 = time.time()
 
-    for i in range(n):
+    pbar = tqdm(range(n), desc=f"Rasterizing [{args.dataset}]", unit="node", dynamic_ncols=True)
+    for i in pbar:
         map_tensor = node_to_ego_map(
             target_node=i,
             edge_index=edge_index_cpu,
@@ -71,16 +73,10 @@ def get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args):
         # Store as uint8 (0-255) to reduce RAM / disk size by 4x
         cached_maps[i] = (map_tensor * 255.0).clamp(0, 255).to(torch.uint8)
 
-        if (i + 1) % 1000 == 0 or (i + 1) == n:
-            elapsed = time.time() - t0
-            rate = (i + 1) / max(elapsed, 0.001)
-            eta_sec = (n - (i + 1)) / max(rate, 0.001)
-            print(f"  Rasterized {i + 1:5d}/{n:5d} nodes ({((i+1)/n)*100:.1f}%) | Speed: {rate:.1f} nodes/sec | ETA: {eta_sec:.1f}s")
-
     # Save to disk
     torch.save(cached_maps, cache_file)
     size_mb = (cached_maps.element_size() * cached_maps.nelement()) / (1024 * 1024)
-    print(f"Rasterization caching complete! Saved {size_mb:.1f} MB to: {cache_file}\n")
+    print(f"\nRasterization caching complete in {time.time() - t0:.2f}s! Saved {size_mb:.1f} MB to: {cache_file}\n")
     return cached_maps
 
 
@@ -183,16 +179,21 @@ def main():
         best_val = float('-inf')
         best_test = float('-inf')
 
-        print(f"\n--- Starting Run {run + 1}/{args.runs} ---")
-
-        for epoch in range(total_epochs):
+        epoch_pbar = tqdm(range(total_epochs), desc=f"Run {run + 1}/{args.runs}", unit="epoch", dynamic_ncols=True)
+        for epoch in epoch_pbar:
             model.train()
             perm = torch.randperm(len(train_idx))
             shuffled_train = train_idx[perm]
             total_loss = 0.0
 
             # Mini-batch training over target nodes
-            for b_start in range(0, len(shuffled_train), args.batch_size):
+            batch_pbar = tqdm(
+                range(0, len(shuffled_train), args.batch_size),
+                desc=f"  Epoch {epoch:02d}",
+                leave=False,
+                dynamic_ncols=True
+            )
+            for b_start in batch_pbar:
                 b_idx = shuffled_train[b_start:b_start + args.batch_size]
                 b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
                 b_feats = dataset.graph['node_feat'][b_idx] if not args.no_node_features else None
@@ -214,6 +215,7 @@ def main():
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item() * len(b_idx)
+                batch_pbar.set_postfix(batch_loss=f"{loss.item():.4f}")
 
             epoch_loss = total_loss / len(train_idx)
 
@@ -229,14 +231,24 @@ def main():
                 if args.save_model:
                     save_model(args, model, optimizer, run)
 
+            # Update epoch progress bar status
+            epoch_pbar.set_postfix({
+                'loss': f"{epoch_loss:.4f}",
+                'val_acc': f"{100 * result[1]:.2f}%",
+                'test_acc': f"{100 * result[2]:.2f}%",
+                'best_test': f"{100 * best_test:.2f}%"
+            })
+
             if epoch % args.display_step == 0:
-                print(f'Epoch: {epoch:02d}, '
-                      f'Loss: {epoch_loss:.4f}, '
-                      f'Train: {100 * result[0]:.2f}%, '
-                      f'Valid: {100 * result[1]:.2f}%, '
-                      f'Test: {100 * result[2]:.2f}%, '
-                      f'Best Valid: {100 * best_val:.2f}%, '
-                      f'Best Test: {100 * best_test:.2f}%')
+                tqdm.write(
+                    f'Epoch: {epoch:02d} | '
+                    f'Loss: {epoch_loss:.4f} | '
+                    f'Train: {100 * result[0]:.2f}% | '
+                    f'Valid: {100 * result[1]:.2f}% | '
+                    f'Test: {100 * result[2]:.2f}% | '
+                    f'Best Valid: {100 * best_val:.2f}% | '
+                    f'Best Test: {100 * best_test:.2f}%'
+                )
 
         logger.print_statistics(run)
 

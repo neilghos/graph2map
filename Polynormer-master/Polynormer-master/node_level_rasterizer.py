@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import networkx as nx
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 from typing import Optional, Tuple
 from torch_geometric.utils import k_hop_subgraph
 
@@ -23,7 +23,7 @@ def compute_ego_layout(
     num_sub_nodes: int,
     sub_edge_index: torch.Tensor,
     target_idx: int,
-    method: str = "pinned_spring",
+    method: str = "concentric",
     seed: int = 42
 ) -> np.ndarray:
     """
@@ -33,6 +33,34 @@ def compute_ego_layout(
     if num_sub_nodes <= 1:
         return np.zeros((num_sub_nodes, 2), dtype=np.float32)
 
+    # Ultra-fast concentric polar rings (sub-millisecond, pure NumPy)
+    if method == "concentric":
+        coords = np.zeros((num_sub_nodes, 2), dtype=np.float32)
+        coords[target_idx] = [0.0, 0.0]
+
+        row, col = sub_edge_index[0], sub_edge_index[1]
+        one_hop = col[row == target_idx].unique().tolist()
+        one_hop_set = set(one_hop)
+        one_hop_set.discard(target_idx)
+
+        # Place 1-hop neighbors on ring 1 (radius 0.35)
+        n_1hop = len(one_hop_set)
+        if n_1hop > 0:
+            for k, node in enumerate(sorted(one_hop_set)):
+                angle = (2.0 * np.pi * k) / n_1hop
+                coords[node] = [0.35 * np.cos(angle), 0.35 * np.sin(angle)]
+
+        # Place 2-hop neighbors on ring 2 (radius 0.70)
+        two_hop = [n for n in range(num_sub_nodes) if n != target_idx and n not in one_hop_set]
+        n_2hop = len(two_hop)
+        if n_2hop > 0:
+            for m, node in enumerate(sorted(two_hop)):
+                angle = (2.0 * np.pi * m) / n_2hop
+                coords[node] = [0.70 * np.cos(angle), 0.70 * np.sin(angle)]
+
+        return coords.astype(np.float32)
+
+    # Pinned spring layout (slower, force-directed)
     G = nx.Graph()
     G.add_nodes_from(range(num_sub_nodes))
     edges = sub_edge_index.t().cpu().numpy()
@@ -43,11 +71,9 @@ def compute_ego_layout(
     pos_dict = None
     if method == "pinned_spring":
         try:
-            # Target node is fixed at (0, 0)
             initial_pos = {target_idx: np.array([0.0, 0.0], dtype=np.float32)}
             for i in range(num_sub_nodes):
                 if i != target_idx:
-                    # Initialize in a small ring around origin
                     angle = (2.0 * np.pi * i) / max(num_sub_nodes - 1, 1)
                     initial_pos[i] = np.array([0.3 * np.cos(angle), 0.3 * np.sin(angle)], dtype=np.float32)
 
@@ -55,7 +81,7 @@ def compute_ego_layout(
                 G,
                 pos=initial_pos,
                 fixed=[target_idx],
-                iterations=35,
+                iterations=15,
                 seed=seed,
                 scale=0.8
             )
@@ -63,30 +89,12 @@ def compute_ego_layout(
             pos_dict = None
 
     if pos_dict is None:
-        # Fallback: concentric rings based on shortest path distance
-        lengths = nx.single_source_shortest_path_length(G, target_idx)
-        coords = np.zeros((num_sub_nodes, 2), dtype=np.float32)
-        by_hop = {}
-        for node, hop in lengths.items():
-            by_hop.setdefault(hop, []).append(node)
-
-        for hop, nodes in by_hop.items():
-            if hop == 0:
-                coords[target_idx] = [0.0, 0.0]
-            else:
-                radius = min(0.35 * hop, 0.75)
-                n_count = len(nodes)
-                for idx_in_hop, node in enumerate(nodes):
-                    angle = (2.0 * np.pi * idx_in_hop) / n_count
-                    coords[node] = [radius * np.cos(angle), radius * np.sin(angle)]
-        return coords
+        return compute_ego_layout(num_sub_nodes, sub_edge_index, target_idx, method="concentric")
 
     coords = np.array([pos_dict[i] for i in range(num_sub_nodes)], dtype=np.float32)
-    # Ensure target node is strictly at (0, 0)
     target_pos = coords[target_idx].copy()
     coords -= target_pos
 
-    # Scale so outer neighbors fit within [-0.75, 0.75]
     max_val = np.max(np.abs(coords))
     if max_val > 1e-6:
         coords = (coords / max_val) * 0.75
@@ -255,55 +263,49 @@ def node_to_ego_map(
     grid_y, grid_x = np.meshgrid(lin, lin, indexing="ij")
     grid = np.stack([grid_x, grid_y], axis=-1)  # (H, W, 2)
 
-    # --- Channel 0: Ego-Density & Distance Field ---
+    # --- Precompute 2D Gaussian node basis ONCE for Ch0, Ch2, Ch3 ---
     diff_nodes = grid[:, :, None, :] - coords[None, None, :, :]
     dist_sq_nodes = np.sum(diff_nodes ** 2, axis=-1)  # (H, W, N)
+    gaussian_nodes = np.exp(-dist_sq_nodes / (2.0 * sigma_node ** 2))
 
-    # Compute hop distances from target
-    G_sub = nx.Graph()
-    G_sub.add_nodes_from(range(num_sub_nodes))
-    edges_np = sub_edge_index.t().cpu().numpy()
-    for u, v in edges_np:
-        G_sub.add_edge(int(u), int(v))
+    # --- Channel 0: Ego-Density & Distance Field ---
+    row, col = sub_edge_index[0], sub_edge_index[1]
+    one_hop_set = set(col[row == target_idx].unique().tolist())
+    one_hop_set.discard(target_idx)
 
-    lengths = nx.single_source_shortest_path_length(G_sub, target_idx)
-    weights = np.array([1.0 / max(lengths.get(i, num_hops), 0.5) for i in range(num_sub_nodes)], dtype=np.float32)
+    weights = np.full((num_sub_nodes,), 1.0 / float(num_hops), dtype=np.float32)
+    for n_idx in one_hop_set:
+        if n_idx < num_sub_nodes:
+            weights[n_idx] = 1.0
     weights[target_idx] = 2.5  # Distinct center anchor glow
 
-    ego_density = np.sum(weights[None, None, :] * np.exp(-dist_sq_nodes / (2.0 * sigma_node ** 2)), axis=-1)
+    ego_density = np.sum(weights[None, None, :] * gaussian_nodes, axis=-1)
 
-    # --- Channel 1: Ego-Edge Interconnections Field (Chunked for memory safety) ---
+    # --- Channel 1: Ego-Edge Interconnections Field (C-accelerated Line Splatting) ---
     num_sub_edges = sub_edge_index.shape[1]
-    ego_edges = np.zeros((resolution, resolution), dtype=np.float32)
-
     if num_sub_edges > 0:
-        p0_all = coords[edges_np[:, 0]]
-        p1_all = coords[edges_np[:, 1]]
-        v_all = p1_all - p0_all
-        len_sq_all = np.maximum(np.sum(v_all ** 2, axis=-1), 1e-8)
+        edges_np = sub_edge_index.t().cpu().numpy()
+        px = (coords[:, 0] + 1.0) * 0.5 * (resolution - 1)
+        py = (coords[:, 1] + 1.0) * 0.5 * (resolution - 1)
 
-        # Chunk edges to keep peak RAM under a few megabytes
-        chunk_size = 64
-        for chunk_start in range(0, num_sub_edges, chunk_size):
-            p0 = p0_all[chunk_start:chunk_start + chunk_size]
-            v = v_all[chunk_start:chunk_start + chunk_size]
-            len_sq = len_sq_all[chunk_start:chunk_start + chunk_size]
+        edge_img = Image.new("L", (resolution, resolution), 0)
+        draw = ImageDraw.Draw(edge_img)
+        for u, v in edges_np:
+            draw.line([(float(px[u]), float(py[u])), (float(px[v]), float(py[v]))], fill=255, width=1)
 
-            p_minus_p0 = grid[:, :, None, :] - p0[None, None, :, :]
-            dot = np.sum(p_minus_p0 * v[None, None, :, :], axis=-1)
-            t = np.clip(dot / len_sq[None, None, :], 0.0, 1.0)
-            closest = p0[None, None, :, :] + t[:, :, :, None] * v[None, None, :, :]
-            dist_sq_edge = np.sum((grid[:, :, None, :] - closest) ** 2, axis=-1)
-
-            ego_edges += np.sum(np.exp(-dist_sq_edge / (2.0 * sigma_edge ** 2)), axis=-1)
+        blur_radius = max(float(sigma_edge * resolution * 0.6), 1.0)
+        blurred = edge_img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        ego_edges = np.array(blurred, dtype=np.float32) / 255.0
+    else:
+        ego_edges = np.zeros((resolution, resolution), dtype=np.float32)
 
     # --- Channel 2: Personalized Diffusion Field (PPR from target node) ---
     ppr_weights = compute_personalized_diffusion(num_sub_nodes, sub_edge_index, target_idx)
-    ego_diffusion = np.sum(ppr_weights[None, None, :] * np.exp(-dist_sq_nodes / (2.0 * sigma_node ** 2)), axis=-1)
+    ego_diffusion = np.sum(ppr_weights[None, None, :] * gaussian_nodes, axis=-1)
 
     # --- Channel 3: Relative Feature Homophily Field ---
     homophily_weights = compute_relative_homophily(sub_x, target_idx)
-    ego_homophily = np.sum(homophily_weights[None, None, :] * np.exp(-dist_sq_nodes / (2.0 * sigma_node ** 2)), axis=-1)
+    ego_homophily = np.sum(homophily_weights[None, None, :] * gaussian_nodes, axis=-1)
 
     # Normalize each channel into [0, 1]
     channels = [ego_density, ego_edges, ego_diffusion, ego_homophily]
