@@ -1,0 +1,33 @@
+# Datasets
+data/
+*.zip
+*.tar.gz
+
+# Caches and Saved Tensors
+cache_maps/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pt
+*.pth
+.cache/
+*.cache
+benchmark_results.json
+
+# Image outputs
+maps_output/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.gif
+*.webp
+
+# Markdown files
+*.md
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
