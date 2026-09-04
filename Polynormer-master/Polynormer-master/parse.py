@@ -2,9 +2,20 @@ from model import Graph2MapClassifier, create_vision_model
 
 def parse_method(args, n, c, d, device):
     use_node_feat = not getattr(args, 'no_node_features', False)
-    backbone = getattr(args, 'backbone', 'egocnn')
+    representation = getattr(args, 'representation', 'spectrogram')
+
+    if representation == 'spectrogram':
+        default_bb = 'spectrogram_cnn'
+        in_chans = getattr(args, 'channels', 3)
+    else:
+        default_bb = 'egocnn'
+        in_chans = getattr(args, 'channels', 8)
+
+    backbone = getattr(args, 'backbone', default_bb)
+    if backbone == 'egocnn' and representation == 'spectrogram':
+        backbone = 'spectrogram_cnn'
+
     pretrained = getattr(args, 'pretrained', False)
-    in_chans = getattr(args, 'channels', 8)
     model = create_vision_model(
         num_classes=c,
         in_chans=in_chans,
@@ -13,12 +24,20 @@ def parse_method(args, n, c, d, device):
         pretrained=pretrained,
         use_node_features=use_node_feat,
         hidden_dim=args.hidden_channels,
-        dropout=args.dropout
+        dropout=args.dropout,
+        representation=representation
     ).to(device)
     return model
 
 
 def parser_add_main_args(parser):
+    # representation mode
+    parser.add_argument('--representation', type=str, default='spectrogram',
+                        choices=['spectrogram', 'ego_map'],
+                        help='visual graph representation: spectrogram (Literal Audio-Mel Spectrogram) or ego_map (Spatial 2D Cartography)')
+    parser.add_argument('--num_bands', type=int, default=128,
+                        help='number of semantic frequency bands for spectrogram (default: 128)')
+
     # dataset and evaluation
     parser.add_argument('--dataset', type=str, default='amazon-photo')
     parser.add_argument('--data_dir', type=str, default='./data/')
@@ -47,12 +66,12 @@ def parser_add_main_args(parser):
     parser.add_argument('--no_smooth_features', action='store_true',
                         help='disable polynomial graph feature smoothing')
 
-    # Graph2Map Vision Model args
+    # Vision Model args
     parser.add_argument('--method', type=str, default='graph2map')
-    parser.add_argument('--backbone', type=str, default='egocnn',
-                        help='vision backbone: egocnn (~580K params), tiny_egocnn (~145K params), or timm backbones (mobilenetv3_small_050, resnet18, etc.)')
-    parser.add_argument('--channels', type=int, default=8, choices=[4, 8],
-                        help='input channels: 8 (Complete Topographic Atlas) or 4 (Topographic Traffic Map)')
+    parser.add_argument('--backbone', type=str, default='spectrogram_cnn',
+                        help='vision backbone: spectrogram_cnn (Time-Frequency ConvNet), egocnn (~580K params), tiny_egocnn (~145K params), or timm backbones')
+    parser.add_argument('--channels', type=int, default=3, choices=[1, 3, 4, 8],
+                        help='input channels: 3 (Spectrogram Consensus+Diff+Resonance), 8 (Complete Atlas), or 4 (Traffic Map)')
     parser.add_argument('--dark_bg', action='store_true',
                         help='use legacy dark background instead of default white-anchored high-contrast background')
     parser.add_argument('--pretrained', action='store_true',
@@ -60,13 +79,13 @@ def parser_add_main_args(parser):
     parser.add_argument('--no_node_features', action='store_true',
                         help='disable fusing raw target node features (pure vision mode)')
     parser.add_argument('--hidden_channels', type=int, default=128)
-    parser.add_argument('--dropout', type=float, default=0.5)
+    parser.add_argument('--dropout', type=float, default=0.3)
 
-    # Ego-Map Rasterization & Caching
+    # Ego-Map & Spectrogram Parameters
     parser.add_argument('--resolution', type=int, default=128,
                         help='canvas resolution for 2D Ego-Map (default 128x128)')
-    parser.add_argument('--num_hops', type=int, default=3,
-                        help='number of hops for computational ego-neighborhood (default: 3)')
+    parser.add_argument('--num_hops', type=int, default=8,
+                        help='number of hops for computational neighborhood / spectrogram height (default: 8)')
     parser.add_argument('--max_nodes', type=int, default=128,
                         help='max bounded nodes in ego-subgraph')
     parser.add_argument('--layout_method', type=str, default='concentric',
@@ -82,8 +101,10 @@ def parser_add_main_args(parser):
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--augment', action='store_true',
                         help='apply random rotation (0, 90, 180, 270 deg) and flip data augmentation')
-    parser.add_argument('--cosine_lr', action='store_true',
-                        help='use cosine annealing learning rate scheduler')
+    parser.add_argument('--cosine_lr', action='store_true', default=True,
+                        help='use cosine annealing learning rate scheduler (default: True)')
+    parser.add_argument('--no_cosine_lr', dest='cosine_lr', action='store_false',
+                        help='disable cosine annealing scheduler')
 
     # display and utility
     parser.add_argument('--display_step', type=int,

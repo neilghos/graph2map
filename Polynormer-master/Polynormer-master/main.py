@@ -15,6 +15,7 @@ from data_utils import eval_acc, eval_rocauc, load_fixed_splits
 from eval import *
 from parse import parse_method, parser_add_main_args
 from node_level_rasterizer import node_to_ego_map, save_ego_map_panel
+from graph_spectrogram import get_or_create_spectrogram_cache
 
 
 def fix_seed(seed=42):
@@ -158,12 +159,15 @@ def main():
     edge_index_cpu = dataset.graph['edge_index'].cpu()
     x_cpu = dataset.graph['node_feat'].cpu() if dataset.graph['node_feat'] is not None else None
 
-    # Pre-rasterize / load cached Ego-Maps
-    cached_maps = get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args)
+    # Pre-rasterize / load representation cache based on --representation flag
+    if getattr(args, 'representation', 'spectrogram') == 'spectrogram':
+        cached_maps = get_or_create_spectrogram_cache(dataset, edge_index_cpu, x_cpu, args)
+    else:
+        cached_maps = get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args)
 
     # Move node features to device for training and apply polynomial graph smoothing if enabled
     if dataset.graph['node_feat'] is not None:
-        if not getattr(args, 'no_smooth_features', False) and args.beta > 0:
+        if not getattr(args, 'no_smooth_features', False) and args.beta > 0 and getattr(args, 'representation', 'spectrogram') == 'ego_map':
             print(f"Applying Polynomial Graph Feature Smoothing (beta={args.beta}) ...")
             edge_index = dataset.graph['edge_index']
             num_nodes = dataset.graph['num_nodes']
@@ -205,7 +209,7 @@ def main():
 
     logger = Logger(args.runs, args)
     total_params = sum(p.numel() for p in model.parameters())
-    backbone_params = sum(p.numel() for p in model.backbone.parameters())
+    backbone_params = sum(p.numel() for p in model.backbone.parameters()) if hasattr(model, 'backbone') else total_params
     print('\nMODEL ARCHITECTURE:', model)
     print(f"-> Model Parameters: Total = {total_params:,} | Backbone ({args.backbone}) = {backbone_params:,}\n")
 
@@ -247,8 +251,8 @@ def main():
                 b_idx = shuffled_train[b_start:b_start + args.batch_size]
                 b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
 
-                # Data Augmentation (D4 dihedral group rotation & flips around center node)
-                if args.augment:
+                # Data Augmentation (D4 dihedral group rotation & flips around center node for Ego-Maps)
+                if args.augment and getattr(args, 'representation', 'spectrogram') == 'ego_map':
                     k = torch.randint(0, 4, (1,)).item()
                     if k > 0:
                         b_maps = torch.rot90(b_maps, k=k, dims=(-2, -1))

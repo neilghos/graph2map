@@ -1,264 +1,276 @@
 """
-Graph2Map Vision Classifier Models (via timm).
-Translates 4-channel node-level Ego-Maps into node class predictions.
+Graph Vision Architectures for Graph-as-an-Image Learning.
+Pure PyTorch implementation (Zero external timm dependencies for instant import).
 
-Supports:
-- Pure Visual Mode: Uses 2D vision backbones (ResNet, ConvNeXt, EfficientNet, MobileNet, ViT)
-  directly on the 4-channel continuous topological Ego-Maps (Ego-Density, Subgraph Edges, PPR Diffusion, Feature Homophily).
-- Hybrid Multimodal Mode: Fuses the visual topological embedding with the target node's raw feature vector
-  via an MLP fusion head.
+Models:
+1. GraphSpectrogramNet: Time-Frequency 2D ConvNet tailored for (C, num_hops, num_bands)
+   Graph Spectrograms with SpecAugment (hop & band masking).
+2. GraphEgoMapNet: Spatial 2D CNN tailored for (C, resolution, resolution)
+   Ego-Centric continuous topological maps.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    import timm
-except ImportError:
-    timm = None
+
+# =============================================================================
+# 1. SPECAUGMENT FOR GRAPH SPECTROGRAMS
+# =============================================================================
+
+class SpecAugment(nn.Module):
+    """SpecAugment for Graph Spectrograms: random hop masking & frequency band masking."""
+    def __init__(self, hop_mask_max: int = 2, freq_mask_max: int = 16):
+        super().__init__()
+        self.hop_mask_max = hop_mask_max
+        self.freq_mask_max = freq_mask_max
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return x
+        b, c, h, w = x.shape
+        # Hop horizon masking
+        if self.hop_mask_max > 0 and h > self.hop_mask_max:
+            h_len = torch.randint(1, self.hop_mask_max + 1, (1,)).item()
+            h_start = torch.randint(0, max(1, h - h_len), (1,)).item()
+            x = x.clone()
+            x[:, :, h_start:h_start + h_len, :] = 0.0
+        # Frequency band masking
+        if self.freq_mask_max > 0 and w > self.freq_mask_max:
+            f_len = torch.randint(1, self.freq_mask_max + 1, (1,)).item()
+            f_start = torch.randint(0, max(1, w - f_len), (1,)).item()
+            x = x.clone()
+            x[:, :, :, f_start:f_start + f_len] = 0.0
+        return x
 
 
-class LightEgoNet(nn.Module):
+# =============================================================================
+# 2. GRAPH SPECTROGRAM CONVNET (Time-Frequency Vision Backbone)
+# =============================================================================
+
+class GraphSpectrogramNet(nn.Module):
     """
-    Compact, specialized 2D CNN backbone tailored for 128x128 multi-channel continuous + canonical Ego-Maps.
-    Keeps parameter counts in the ~100k - ~580k range (matching standard Graph Neural Network
-    parameter budgets) to eliminate overfitting on graph benchmark datasets.
+    Time-Frequency 2D ConvNet specifically optimized for Graph Spectrogram inputs.
+    Uses rectangular kernels (capturing multi-hop temporal evolution across frequency bands)
+    with residual pooling and adaptive global spectral aggregation.
     """
     def __init__(
         self,
-        in_chans: int = 4,
-        out_dim: int = 256,
+        in_channels: int = 3,
+        num_classes: int = 8,
+        node_feat_dim: int = 0,
+        hidden_dim: int = 128,
         dropout: float = 0.3,
-        width_multiplier: float = 1.0
+        use_node_features: bool = True
     ):
         super().__init__()
-        c1 = max(16, int(32 * width_multiplier))
-        c2 = max(32, int(64 * width_multiplier))
-        c3 = max(64, int(128 * width_multiplier))
-        c4 = max(128, int(256 * width_multiplier))
+        self.use_node_features = use_node_features and (node_feat_dim > 0)
+        self.spec_augment = SpecAugment(hop_mask_max=2, freq_mask_max=16)
 
-        self.num_features = c4
-
-        # Stage 1: 128x128 -> 64x64
-        self.stage1 = nn.Sequential(
-            nn.Conv2d(in_chans, c1, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(c1),
+        # Time-Frequency Spectrogram Vision Backbone
+        self.backbone = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=(3, 5), padding=(1, 2), bias=False),
+            nn.BatchNorm2d(64),
             nn.GELU(),
-            nn.Conv2d(c1, c1, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(c1),
+            nn.Conv2d(64, 128, kernel_size=(3, 5), padding=(1, 2), bias=False),
+            nn.BatchNorm2d(128),
             nn.GELU(),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(dropout * 0.3)
-        )
-
-        # Stage 2: 64x64 -> 32x32
-        self.stage2 = nn.Sequential(
-            nn.Conv2d(c1, c2, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(c2),
+            nn.MaxPool2d(kernel_size=(1, 2)),
+            nn.Conv2d(128, 128, kernel_size=(3, 3), padding=(1, 1), bias=False),
+            nn.BatchNorm2d(128),
             nn.GELU(),
-            nn.Conv2d(c2, c2, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(c2),
-            nn.GELU(),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(dropout * 0.4)
-        )
-
-        # Stage 3: 32x32 -> 16x16
-        self.stage3 = nn.Sequential(
-            nn.Conv2d(c2, c3, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(c3),
-            nn.GELU(),
-            nn.Conv2d(c3, c3, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(c3),
-            nn.GELU(),
-            nn.MaxPool2d(2),
-            nn.Dropout2d(dropout * 0.5)
-        )
-
-        # Stage 4: 16x16 -> 8x8 -> Global Average Pooling
-        self.stage4 = nn.Sequential(
-            nn.Conv2d(c3, c4, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(c4),
+            nn.Conv2d(128, hidden_dim, kernel_size=(3, 3), padding=(1, 1), bias=False),
+            nn.BatchNorm2d(hidden_dim),
             nn.GELU(),
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten()
         )
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.stage4(x)
-        return x
-
-
-class Graph2MapClassifier(nn.Module):
-    def __init__(
-        self,
-        num_classes: int,
-        in_chans: int = 4,
-        backbone_name: str = "egocnn",
-        pretrained: bool = False,
-        node_feat_dim: int = 0,
-        use_node_features: bool = True,
-        hidden_dim: int = 256,
-        dropout: float = 0.3,
-        drop_rate: float = 0.0
-    ):
-        """
-        Args:
-            num_classes: Number of target node classes.
-            in_chans: Number of input Ego-Map channels (default 4).
-            backbone_name: Vision backbone name. Supports:
-                - 'egocnn' / 'lightegonet': Custom tight 4-stage CNN (~580K params).
-                - 'tiny_egocnn': Ultra-tight 4-stage CNN (~145K params, matching classic GNN scale).
-                - Any timm backbone (e.g. 'mobilenetv3_small_050', 'mobilenetv3_small_100', 'resnet18').
-            pretrained: Whether to load ImageNet pre-trained weights (adapted for in_chans=4).
-            node_feat_dim: Dimension of raw node feature vector (if 0 or use_node_features=False, pure vision is used).
-            use_node_features: Whether to fuse raw target node feature vector with the visual topology embedding.
-            hidden_dim: Hidden dimension for fusion and classifier head.
-            dropout: Dropout probability.
-            drop_rate: Backbone internal drop rate if supported.
-        """
-        super().__init__()
-        self.backbone_name = backbone_name
-        self.num_classes = num_classes
-        self.in_chans = in_chans
-        self.node_feat_dim = node_feat_dim
-        self.use_node_features = use_node_features and (node_feat_dim > 0)
-        self.hidden_dim = hidden_dim
-
-        # 1. Instantiate Vision Backbone
-        if backbone_name in ('egocnn', 'lightegonet', 'light_cnn'):
-            self.backbone = LightEgoNet(in_chans=in_chans, out_dim=hidden_dim, dropout=dropout, width_multiplier=1.0)
-            self.vis_dim = self.backbone.num_features
-        elif backbone_name in ('tiny_egocnn', 'tiny_cnn', 'micro_egocnn'):
-            self.backbone = LightEgoNet(in_chans=in_chans, out_dim=hidden_dim, dropout=dropout, width_multiplier=0.5)
-            self.vis_dim = self.backbone.num_features
-        else:
-            if timm is None:
-                raise ImportError(
-                    "The 'timm' package is required for timm-based backbones. "
-                    "Install it using: pip install timm"
-                )
-            self.backbone = timm.create_model(
-                backbone_name,
-                pretrained=pretrained,
-                in_chans=in_chans,
-                num_classes=0,
-                drop_rate=dropout if drop_rate == 0.0 else drop_rate
-            )
-            self.vis_dim = self.backbone.num_features
-
-        self.vis_dropout = nn.Dropout(dropout)
-
-        # 2. Target Node Feature Encoder (if hybrid mode is active)
+        # Raw node feature projection (optional fusion)
         if self.use_node_features:
-            self.node_encoder = nn.Sequential(
+            self.feat_mlp = nn.Sequential(
                 nn.Linear(node_feat_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
                 nn.GELU(),
-                nn.Dropout(dropout)
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim)
             )
-            fusion_in_dim = self.vis_dim + hidden_dim
+            classifier_in = hidden_dim * 2
         else:
-            self.node_encoder = None
-            fusion_in_dim = self.vis_dim
+            self.feat_mlp = None
+            classifier_in = hidden_dim
 
-        # 3. Final Classification Head
-        self.head = nn.Sequential(
-            nn.Linear(fusion_in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+        self.classifier = nn.Sequential(
+            nn.Linear(classifier_in, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_classes)
         )
 
     def reset_parameters(self):
-        """
-        Reset model parameters to support standard multi-run benchmark loops.
-        """
-        # Re-initialize non-backbone modules
-        if self.node_encoder is not None:
-            for m in self.node_encoder.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-                elif isinstance(m, nn.LayerNorm):
-                    nn.init.ones_(m.weight)
-                    nn.init.zeros_(m.bias)
-
-        for m in self.head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-
-        # Re-initialize backbone weights
-        for m in self.backbone.modules():
+        for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)):
+            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
                 if hasattr(m, 'weight') and m.weight is not None:
                     nn.init.ones_(m.weight)
                 if hasattr(m, 'bias') and m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(
-        self,
-        ego_maps: torch.Tensor,
-        node_feats: torch.Tensor = None
-    ) -> torch.Tensor:
-        """
-        Forward pass.
-        Args:
-            ego_maps: 4D Tensor of shape (B, 4, H, W) containing continuous 2D Ego-Maps.
-            node_feats: Optional 2D Tensor of shape (B, node_feat_dim) containing target node raw attributes.
-        Returns:
-            Logits Tensor of shape (B, num_classes).
-        """
-        # 1. Extract visual embedding from 4-channel Ego-Map
-        vis_emb = self.vis_dropout(self.backbone(ego_maps))  # (B, vis_dim)
+    def forward(self, spec: torch.Tensor, raw_x: torch.Tensor = None) -> torch.Tensor:
+        x = self.spec_augment(spec)
+        v_emb = self.dropout(self.backbone(x))
 
-        # 2. Fuse with raw target node attributes if enabled
-        if self.use_node_features and node_feats is not None:
-            node_emb = self.node_encoder(node_feats)  # (B, hidden_dim)
-            combined = torch.cat([vis_emb, node_emb], dim=-1)  # (B, vis_dim + hidden_dim)
+        if self.use_node_features and raw_x is not None:
+            f_emb = self.feat_mlp(raw_x)
+            fused = torch.cat([v_emb, f_emb], dim=1)
         else:
-            combined = vis_emb
+            fused = v_emb
 
-        # 3. Predict class logits
-        logits = self.head(combined)  # (B, num_classes)
-        return logits
+        return self.classifier(fused)
 
+
+# =============================================================================
+# 3. GRAPH EGO-MAP CONVNET (Spatial Cartography Vision Backbone)
+# =============================================================================
+
+class GraphEgoMapNet(nn.Module):
+    """
+    Compact, specialized 2D CNN backbone tailored for 128x128 multi-channel continuous Ego-Maps.
+    """
+    def __init__(
+        self,
+        in_channels: int = 4,
+        num_classes: int = 8,
+        node_feat_dim: int = 0,
+        hidden_dim: int = 256,
+        dropout: float = 0.3,
+        use_node_features: bool = True
+    ):
+        super().__init__()
+        self.use_node_features = use_node_features and (node_feat_dim > 0)
+
+        # 4-stage Spatial CNN Backbone
+        self.backbone = nn.Sequential(
+            # Stage 1: 128x128 -> 64x64
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+            # Stage 2: 64x64 -> 32x32
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+            # Stage 3: 32x32 -> 16x16
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+            # Stage 4: 16x16 -> Global Average Pooling
+            nn.Conv2d(128, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten()
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        if self.use_node_features:
+            self.feat_mlp = nn.Sequential(
+                nn.Linear(node_feat_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim)
+            )
+            classifier_in = hidden_dim * 2
+        else:
+            self.feat_mlp = None
+            classifier_in = hidden_dim
+
+        self.classifier = nn.Sequential(
+            nn.Linear(classifier_in, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+    def reset_parameters(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                if hasattr(m, 'weight') and m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if hasattr(m, 'bias') and m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, ego_map: torch.Tensor, raw_x: torch.Tensor = None) -> torch.Tensor:
+        v_emb = self.dropout(self.backbone(ego_map))
+
+        if self.use_node_features and raw_x is not None:
+            f_emb = self.feat_mlp(raw_x)
+            fused = torch.cat([v_emb, f_emb], dim=1)
+        else:
+            fused = v_emb
+
+        return self.classifier(fused)
+
+
+# Backward-compatibility aliases
+SpectrogramCNN = GraphSpectrogramNet
+LightEgoNet = GraphEgoMapNet
+Graph2MapClassifier = GraphEgoMapNet
+
+
+# =============================================================================
+# 4. UNIFIED MODEL FACTORY
+# =============================================================================
 
 def create_vision_model(
     num_classes: int,
-    in_chans: int = 4,
+    in_chans: int = 3,
     node_feat_dim: int = 0,
-    backbone_name: str = "egocnn",
+    backbone_name: str = "spectrogram_cnn",
     pretrained: bool = False,
     use_node_features: bool = True,
-    hidden_dim: int = 256,
-    dropout: float = 0.5
-) -> Graph2MapClassifier:
+    hidden_dim: int = 128,
+    dropout: float = 0.3,
+    representation: str = "spectrogram"
+) -> nn.Module:
     """
-    Helper function to instantiate Graph2MapClassifier.
+    Unified factory function to instantiate GraphSpectrogramNet or GraphEgoMapNet.
     """
-    return Graph2MapClassifier(
-        num_classes=num_classes,
-        in_chans=in_chans,
-        backbone_name=backbone_name,
-        pretrained=pretrained,
-        node_feat_dim=node_feat_dim,
-        use_node_features=use_node_features,
-        hidden_dim=hidden_dim,
-        dropout=dropout
-    )
+    if representation == "spectrogram" or backbone_name in ("spectrogram_cnn", "spectrogram_net", "spectrogram"):
+        return GraphSpectrogramNet(
+            in_channels=in_chans,
+            num_classes=num_classes,
+            node_feat_dim=node_feat_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            use_node_features=use_node_features
+        )
+    else:
+        return GraphEgoMapNet(
+            in_channels=in_chans,
+            num_classes=num_classes,
+            node_feat_dim=node_feat_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            use_node_features=use_node_features
+        )
