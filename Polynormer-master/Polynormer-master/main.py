@@ -162,7 +162,10 @@ def main():
         eval_func = eval_acc
 
     logger = Logger(args.runs, args)
+    total_params = sum(p.numel() for p in model.parameters())
+    backbone_params = sum(p.numel() for p in model.backbone.parameters())
     print('\nMODEL ARCHITECTURE:', model)
+    print(f"-> Model Parameters: Total = {total_params:,} | Backbone ({args.backbone}) = {backbone_params:,}\n")
 
     total_epochs = args.epochs if args.epochs > 0 else (args.local_epochs + args.global_epochs)
 
@@ -176,6 +179,11 @@ def main():
         train_idx = split_idx['train']
         model.reset_parameters()
         optimizer = torch.optim.Adam(model.parameters(), weight_decay=args.weight_decay, lr=args.lr)
+        scheduler = None
+        if args.cosine_lr:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=total_epochs, eta_min=args.lr * 0.01
+            )
         best_val = float('-inf')
         best_test = float('-inf')
 
@@ -196,6 +204,17 @@ def main():
             for b_start in batch_pbar:
                 b_idx = shuffled_train[b_start:b_start + args.batch_size]
                 b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
+
+                # Data Augmentation (D4 dihedral group rotation & flips around center node)
+                if args.augment:
+                    k = torch.randint(0, 4, (1,)).item()
+                    if k > 0:
+                        b_maps = torch.rot90(b_maps, k=k, dims=(-2, -1))
+                    if torch.rand(1).item() > 0.5:
+                        b_maps = torch.flip(b_maps, dims=[-1])
+                    if torch.rand(1).item() > 0.5:
+                        b_maps = torch.flip(b_maps, dims=[-2])
+
                 b_feats = dataset.graph['node_feat'][b_idx] if not args.no_node_features else None
                 b_targets = dataset.label.squeeze(1)[b_idx.to(device)]
 
@@ -216,6 +235,9 @@ def main():
                 optimizer.step()
                 total_loss += loss.item() * len(b_idx)
                 batch_pbar.set_postfix(batch_loss=f"{loss.item():.4f}")
+
+            if scheduler is not None:
+                scheduler.step()
 
             epoch_loss = total_loss / len(train_idx)
 

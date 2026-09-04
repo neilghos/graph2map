@@ -37,14 +37,14 @@ def parser_add_main_args(parser):
 
     # Graph2Map Vision Model args
     parser.add_argument('--method', type=str, default='graph2map')
-    parser.add_argument('--backbone', type=str, default='resnet18',
-                        help='vision backbone from timm (e.g. resnet18, resnet34, convnext_tiny, efficientnet_b0)')
+    parser.add_argument('--backbone', type=str, default='egocnn',
+                        help='vision backbone: egocnn (~580K params), tiny_egocnn (~145K params), or timm backbones (mobilenetv3_small_050, resnet18, etc.)')
     parser.add_argument('--pretrained', action='store_true',
                         help='whether to use pretrained vision backbone weights')
     parser.add_argument('--no_node_features', action='store_true',
                         help='disable fusing raw target node features (pure vision mode)')
     parser.add_argument('--hidden_channels', type=int, default=256)
-    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--dropout', type=float, default=0.5)
 
     # Ego-Map Rasterization & Caching
     parser.add_argument('--resolution', type=int, default=128,
@@ -64,6 +64,10 @@ def parser_add_main_args(parser):
     # training
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--augment', action='store_true',
+                        help='apply random rotation (0, 90, 180, 270 deg) and flip data augmentation')
+    parser.add_argument('--cosine_lr', action='store_true',
+                        help='use cosine annealing learning rate scheduler')
 
     # display and utility
     parser.add_argument('--display_step', type=int,

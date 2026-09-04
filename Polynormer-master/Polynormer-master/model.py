@@ -19,12 +19,86 @@ except ImportError:
     timm = None
 
 
+class LightEgoNet(nn.Module):
+    """
+    Compact, specialized 2D CNN backbone tailored for 128x128 4-channel continuous Ego-Maps.
+    Keeps parameter counts in the ~100k - ~580k range (matching standard Graph Neural Network
+    parameter budgets) to eliminate overfitting on graph benchmark datasets.
+    """
+    def __init__(
+        self,
+        in_chans: int = 4,
+        out_dim: int = 256,
+        dropout: float = 0.3,
+        width_multiplier: float = 1.0
+    ):
+        super().__init__()
+        c1 = max(16, int(32 * width_multiplier))
+        c2 = max(32, int(64 * width_multiplier))
+        c3 = max(64, int(128 * width_multiplier))
+        c4 = max(128, int(256 * width_multiplier))
+
+        self.num_features = c4
+
+        # Stage 1: 128x128 -> 64x64
+        self.stage1 = nn.Sequential(
+            nn.Conv2d(in_chans, c1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.GELU(),
+            nn.Conv2d(c1, c1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout * 0.3)
+        )
+
+        # Stage 2: 64x64 -> 32x32
+        self.stage2 = nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.GELU(),
+            nn.Conv2d(c2, c2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout * 0.4)
+        )
+
+        # Stage 3: 32x32 -> 16x16
+        self.stage3 = nn.Sequential(
+            nn.Conv2d(c2, c3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c3),
+            nn.GELU(),
+            nn.Conv2d(c3, c3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c3),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(dropout * 0.5)
+        )
+
+        # Stage 4: 16x16 -> 8x8 -> Global Average Pooling
+        self.stage4 = nn.Sequential(
+            nn.Conv2d(c3, c4, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c4),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        return x
+
+
 class Graph2MapClassifier(nn.Module):
     def __init__(
         self,
         num_classes: int,
         in_chans: int = 4,
-        backbone_name: str = "resnet18",
+        backbone_name: str = "egocnn",
         pretrained: bool = False,
         node_feat_dim: int = 0,
         use_node_features: bool = True,
@@ -36,7 +110,10 @@ class Graph2MapClassifier(nn.Module):
         Args:
             num_classes: Number of target node classes.
             in_chans: Number of input Ego-Map channels (default 4).
-            backbone_name: Vision backbone from timm (e.g. 'resnet18', 'resnet34', 'convnext_tiny', 'efficientnet_b0').
+            backbone_name: Vision backbone name. Supports:
+                - 'egocnn' / 'lightegonet': Custom tight 4-stage CNN (~580K params).
+                - 'tiny_egocnn': Ultra-tight 4-stage CNN (~145K params, matching classic GNN scale).
+                - Any timm backbone (e.g. 'mobilenetv3_small_050', 'mobilenetv3_small_100', 'resnet18').
             pretrained: Whether to load ImageNet pre-trained weights (adapted for in_chans=4).
             node_feat_dim: Dimension of raw node feature vector (if 0 or use_node_features=False, pure vision is used).
             use_node_features: Whether to fuse raw target node feature vector with the visual topology embedding.
@@ -45,12 +122,6 @@ class Graph2MapClassifier(nn.Module):
             drop_rate: Backbone internal drop rate if supported.
         """
         super().__init__()
-        if timm is None:
-            raise ImportError(
-                "The 'timm' package is required for Graph2MapClassifier. "
-                "Install it using: pip install timm"
-            )
-
         self.backbone_name = backbone_name
         self.num_classes = num_classes
         self.in_chans = in_chans
@@ -58,18 +129,29 @@ class Graph2MapClassifier(nn.Module):
         self.use_node_features = use_node_features and (node_feat_dim > 0)
         self.hidden_dim = hidden_dim
 
-        # 1. Instantiate Vision Backbone using timm
-        # num_classes=0 returns the pooled feature embedding vector
-        self.backbone = timm.create_model(
-            backbone_name,
-            pretrained=pretrained,
-            in_chans=in_chans,
-            num_classes=0,
-            drop_rate=drop_rate
-        )
+        # 1. Instantiate Vision Backbone
+        if backbone_name in ('egocnn', 'lightegonet', 'light_cnn'):
+            self.backbone = LightEgoNet(in_chans=in_chans, out_dim=hidden_dim, dropout=dropout, width_multiplier=1.0)
+            self.vis_dim = self.backbone.num_features
+        elif backbone_name in ('tiny_egocnn', 'tiny_cnn', 'micro_egocnn'):
+            self.backbone = LightEgoNet(in_chans=in_chans, out_dim=hidden_dim, dropout=dropout, width_multiplier=0.5)
+            self.vis_dim = self.backbone.num_features
+        else:
+            if timm is None:
+                raise ImportError(
+                    "The 'timm' package is required for timm-based backbones. "
+                    "Install it using: pip install timm"
+                )
+            self.backbone = timm.create_model(
+                backbone_name,
+                pretrained=pretrained,
+                in_chans=in_chans,
+                num_classes=0,
+                drop_rate=dropout if drop_rate == 0.0 else drop_rate
+            )
+            self.vis_dim = self.backbone.num_features
 
-        # Retrieve visual embedding dimension
-        self.vis_dim = self.backbone.num_features
+        self.vis_dropout = nn.Dropout(dropout)
 
         # 2. Target Node Feature Encoder (if hybrid mode is active)
         if self.use_node_features:
@@ -143,7 +225,7 @@ class Graph2MapClassifier(nn.Module):
             Logits Tensor of shape (B, num_classes).
         """
         # 1. Extract visual embedding from 4-channel Ego-Map
-        vis_emb = self.backbone(ego_maps)  # (B, vis_dim)
+        vis_emb = self.vis_dropout(self.backbone(ego_maps))  # (B, vis_dim)
 
         # 2. Fuse with raw target node attributes if enabled
         if self.use_node_features and node_feats is not None:
@@ -160,11 +242,11 @@ class Graph2MapClassifier(nn.Module):
 def create_vision_model(
     num_classes: int,
     node_feat_dim: int = 0,
-    backbone_name: str = "resnet18",
+    backbone_name: str = "egocnn",
     pretrained: bool = False,
     use_node_features: bool = True,
     hidden_dim: int = 256,
-    dropout: float = 0.3
+    dropout: float = 0.5
 ) -> Graph2MapClassifier:
     """
     Helper function to instantiate Graph2MapClassifier.
