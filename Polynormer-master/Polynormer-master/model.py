@@ -18,36 +18,6 @@ import torch.nn.functional as F
 # 1. SPECAUGMENT FOR GRAPH SPECTROGRAMS
 # =============================================================================
 
-class SpecAugment(nn.Module):
-    """SpecAugment for Graph Spectrograms: random hop masking & frequency band masking."""
-    def __init__(self, hop_mask_max: int = 2, freq_mask_max: int = 16):
-        super().__init__()
-        self.hop_mask_max = hop_mask_max
-        self.freq_mask_max = freq_mask_max
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training:
-            return x
-        b, c, h, w = x.shape
-        # Hop horizon masking
-        if self.hop_mask_max > 0 and h > self.hop_mask_max:
-            h_len = torch.randint(1, self.hop_mask_max + 1, (1,)).item()
-            h_start = torch.randint(0, max(1, h - h_len), (1,)).item()
-            x = x.clone()
-            x[:, :, h_start:h_start + h_len, :] = 0.0
-        # Frequency band masking
-        if self.freq_mask_max > 0 and w > self.freq_mask_max:
-            f_len = torch.randint(1, self.freq_mask_max + 1, (1,)).item()
-            f_start = torch.randint(0, max(1, w - f_len), (1,)).item()
-            x = x.clone()
-            x[:, :, :, f_start:f_start + f_len] = 0.0
-        return x
-
-
-# =============================================================================
-# 2. GRAPH SPECTROGRAM CONVNET (Time-Frequency Vision Backbone)
-# =============================================================================
-
 class GraphSpectrogramNet(nn.Module):
     """
     Time-Frequency 2D ConvNet specifically optimized for Graph Spectrogram inputs.
@@ -56,7 +26,7 @@ class GraphSpectrogramNet(nn.Module):
     """
     def __init__(
         self,
-        in_channels: int = 3,
+        in_channels: int = 6,
         num_classes: int = 8,
         node_feat_dim: int = 0,
         hidden_dim: int = 128,
@@ -65,7 +35,6 @@ class GraphSpectrogramNet(nn.Module):
     ):
         super().__init__()
         self.use_node_features = use_node_features and (node_feat_dim > 0)
-        self.spec_augment = SpecAugment(hop_mask_max=2, freq_mask_max=16)
 
         # Time-Frequency Spectrogram Vision Backbone
         self.backbone = nn.Sequential(
@@ -121,8 +90,7 @@ class GraphSpectrogramNet(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, spec: torch.Tensor, raw_x: torch.Tensor = None) -> torch.Tensor:
-        x = self.spec_augment(spec)
-        v_emb = self.dropout(self.backbone(x))
+        v_emb = self.dropout(self.backbone(spec))
 
         if self.use_node_features and raw_x is not None:
             f_emb = self.feat_mlp(raw_x)
@@ -244,7 +212,7 @@ Graph2MapClassifier = GraphEgoMapNet
 
 def create_vision_model(
     num_classes: int,
-    in_chans: int = 3,
+    in_chans: int = 6,
     node_feat_dim: int = 0,
     backbone_name: str = "spectrogram_cnn",
     pretrained: bool = False,
@@ -256,8 +224,8 @@ def create_vision_model(
     """
     Unified factory function to instantiate GraphSpectrogramNet or GraphEgoMapNet.
     """
-    if representation == "spectrogram" or backbone_name in ("spectrogram_cnn", "spectrogram_net", "spectrogram"):
-        return GraphSpectrogramNet(
+    if representation in ("atlas", "atlas_7ch", "atlas_10ch", "ego_map") or backbone_name in ("egocnn", "graph_ego_map_net", "ego"):
+        return GraphEgoMapNet(
             in_channels=in_chans,
             num_classes=num_classes,
             node_feat_dim=node_feat_dim,
@@ -266,7 +234,7 @@ def create_vision_model(
             use_node_features=use_node_features
         )
     else:
-        return GraphEgoMapNet(
+        return GraphSpectrogramNet(
             in_channels=in_chans,
             num_classes=num_classes,
             node_feat_dim=node_feat_dim,

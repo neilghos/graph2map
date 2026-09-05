@@ -15,7 +15,7 @@ from data_utils import eval_acc, eval_rocauc, load_fixed_splits
 from eval import *
 from parse import parse_method, parser_add_main_args
 from node_level_rasterizer import node_to_ego_map, save_ego_map_panel
-from graph_spectrogram import get_or_create_spectrogram_cache
+from extractor import get_or_create_spectrogram_cache, get_or_create_atlas_cache, get_or_create_10ch_atlas_cache
 
 
 def fix_seed(seed=42):
@@ -162,6 +162,8 @@ def main():
     # Pre-rasterize / load representation cache based on --representation flag
     if getattr(args, 'representation', 'spectrogram') == 'spectrogram':
         cached_maps = get_or_create_spectrogram_cache(dataset, edge_index_cpu, x_cpu, args)
+    elif getattr(args, 'representation', 'spectrogram') in ('atlas', 'atlas_10ch', 'atlas_7ch'):
+        cached_maps = get_or_create_10ch_atlas_cache(dataset, edge_index_cpu, x_cpu, args)
     else:
         cached_maps = get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args)
 

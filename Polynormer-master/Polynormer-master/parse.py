@@ -4,16 +4,19 @@ def parse_method(args, n, c, d, device):
     use_node_feat = not getattr(args, 'no_node_features', False)
     representation = getattr(args, 'representation', 'spectrogram')
 
-    if representation == 'spectrogram':
+    if representation in ('atlas', 'atlas_7ch', 'atlas_10ch'):
+        default_bb = 'egocnn'
+        in_chans = args.channels if args.channels in (7, 10) else 7
+    elif representation == 'spectrogram':
         default_bb = 'spectrogram_cnn'
-        in_chans = getattr(args, 'channels', 3)
+        in_chans = args.channels if args.channels in (1, 3, 6) else 3
     else:
         default_bb = 'egocnn'
-        in_chans = getattr(args, 'channels', 8)
+        in_chans = args.channels if args.channels in (4, 8) else 4
 
-    backbone = getattr(args, 'backbone', default_bb)
-    if backbone == 'egocnn' and representation == 'spectrogram':
-        backbone = 'spectrogram_cnn'
+    backbone = getattr(args, 'backbone', None)
+    if backbone is None or (backbone == 'spectrogram_cnn' and representation in ('atlas', 'atlas_7ch', 'atlas_10ch', 'ego_map')):
+        backbone = default_bb
 
     pretrained = getattr(args, 'pretrained', False)
     model = create_vision_model(
@@ -33,8 +36,8 @@ def parse_method(args, n, c, d, device):
 def parser_add_main_args(parser):
     # representation mode
     parser.add_argument('--representation', type=str, default='spectrogram',
-                        choices=['spectrogram', 'ego_map'],
-                        help='visual graph representation: spectrogram (Literal Audio-Mel Spectrogram) or ego_map (Spatial 2D Cartography)')
+                        choices=['spectrogram', 'atlas', 'ego_map'],
+                        help='visual graph representation: spectrogram (Audio-Mel Spectrogram), atlas (7-Channel Spectral+Spatial Master Atlas), or ego_map (Spatial 2D Cartography)')
     parser.add_argument('--num_bands', type=int, default=128,
                         help='number of semantic frequency bands for spectrogram (default: 128)')
 
@@ -68,10 +71,10 @@ def parser_add_main_args(parser):
 
     # Vision Model args
     parser.add_argument('--method', type=str, default='graph2map')
-    parser.add_argument('--backbone', type=str, default='spectrogram_cnn',
-                        help='vision backbone: spectrogram_cnn (Time-Frequency ConvNet), egocnn (~580K params), tiny_egocnn (~145K params), or timm backbones')
-    parser.add_argument('--channels', type=int, default=3, choices=[1, 3, 4, 8],
-                        help='input channels: 3 (Spectrogram Consensus+Diff+Resonance), 8 (Complete Atlas), or 4 (Traffic Map)')
+    parser.add_argument('--backbone', type=str, default=None,
+                        help='vision backbone: auto-selected (egocnn for atlas/ego_map, spectrogram_cnn for spectrogram)')
+    parser.add_argument('--channels', type=int, default=3, choices=[1, 3, 4, 6, 7, 8, 10],
+                        help='input channels: 3 (Spectrogram), 7 (Master Atlas: 3 Spectral + 4 Spatial), 4 (Ego-Map)')
     parser.add_argument('--dark_bg', action='store_true',
                         help='use legacy dark background instead of default white-anchored high-contrast background')
     parser.add_argument('--pretrained', action='store_true',
