@@ -253,15 +253,16 @@ def main():
                 b_idx = shuffled_train[b_start:b_start + args.batch_size]
                 b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
 
-                # Data Augmentation (D4 dihedral group rotation & flips around center node for Ego-Maps)
-                if args.augment and getattr(args, 'representation', 'spectrogram') == 'ego_map':
+                # Data Augmentation (D4 dihedral group rotation & flips for spatial channels)
+                if args.augment:
+                    spatial_start = 3 if getattr(args, 'representation', 'spectrogram') in ('atlas', 'atlas_7ch', 'atlas_10ch') else 0
                     k = torch.randint(0, 4, (1,)).item()
                     if k > 0:
-                        b_maps = torch.rot90(b_maps, k=k, dims=(-2, -1))
+                        b_maps[:, spatial_start:] = torch.rot90(b_maps[:, spatial_start:], k=k, dims=(-2, -1))
                     if torch.rand(1).item() > 0.5:
-                        b_maps = torch.flip(b_maps, dims=[-1])
+                        b_maps[:, spatial_start:] = torch.flip(b_maps[:, spatial_start:], dims=[-1])
                     if torch.rand(1).item() > 0.5:
-                        b_maps = torch.flip(b_maps, dims=[-2])
+                        b_maps[:, spatial_start:] = torch.flip(b_maps[:, spatial_start:], dims=[-2])
 
                 b_feats = dataset.graph['node_feat'][b_idx] if not args.no_node_features else None
                 b_targets = dataset.label.squeeze(1)[b_idx.to(device)]
@@ -276,8 +277,8 @@ def main():
                         true_label = b_targets
                     loss = criterion(out_batch, true_label.to(torch.float))
                 else:
-                    log_probs = F.log_softmax(out_batch, dim=1)
-                    loss = criterion(log_probs, b_targets)
+                    label_smooth = getattr(args, 'label_smoothing', 0.1)
+                    loss = F.cross_entropy(out_batch, b_targets, label_smoothing=label_smooth)
 
                 loss.backward()
                 optimizer.step()
