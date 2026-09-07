@@ -113,7 +113,11 @@ def predict_all_nodes(model, cached_maps, node_feat, args, device):
 
     for b_start in range(0, n_nodes, batch_size):
         b_idx = torch.arange(b_start, min(b_start + batch_size, n_nodes))
-        b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
+        if cached_maps.dim() == 5:
+            # Variant 0 is the deterministic canonical layout for evaluation
+            b_maps = (cached_maps[b_idx, 0].to(device).float()) / 255.0
+        else:
+            b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
         b_feats = node_feat[b_idx] if (node_feat is not None and not args.no_node_features) else None
         logits = model(b_maps, b_feats)
         all_out.append(logits.cpu())
@@ -251,7 +255,12 @@ def main():
             )
             for b_start in batch_pbar:
                 b_idx = shuffled_train[b_start:b_start + args.batch_size]
-                b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
+                if cached_maps.dim() == 5:
+                    num_vars = cached_maps.size(1)
+                    var_idx = torch.randint(0, num_vars, (len(b_idx),))
+                    b_maps = (cached_maps[b_idx, var_idx].to(device).float()) / 255.0
+                else:
+                    b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
 
                 # Data Augmentation (D4 dihedral group rotation & flips for spatial channels)
                 if args.augment:
