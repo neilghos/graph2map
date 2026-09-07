@@ -1,14 +1,14 @@
 """
-Node-Level Ego-Map Rasterizer (Graph2Map for Node Classification).
-Converts the k-hop local computational neighborhood of a target node into a
-multi-channel continuous 2D spatial heatmap with the target node pinned at (0, 0).
-
-Channels:
-  - Ch 0: Ego-Density Field (Target at (0, 0), neighbors weighted by inverse hop distance)
-  - Ch 1: Ego-Edge Interconnection Field (Continuous line splatting of intra-neighborhood edges)
-  - Ch 2: Personalized Diffusion Field (Personalized PageRank / RWR starting from target node v)
-  - Ch 3: Relative Feature Homophily Field (Cosine similarity between neighbor features and target v)
+=============================================================================
+STALE / DEPRECATED SCRIPT: node_level_rasterizer.py
+=============================================================================
+This standalone 2D ego-map cartography script is archived and disconnected
+from the active training pipeline.
+The active and supported multi-channel representation is the 7-Channel Master
+Graph Visual Atlas implemented in extractor.py.
+=============================================================================
 """
+
 
 import numpy as np
 import torch

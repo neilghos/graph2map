@@ -14,8 +14,8 @@ from dataset import load_dataset
 from data_utils import eval_acc, eval_rocauc, load_fixed_splits
 from eval import *
 from parse import parse_method, parser_add_main_args
-from node_level_rasterizer import node_to_ego_map, save_ego_map_panel
-from extractor import get_or_create_spectrogram_cache, get_or_create_atlas_cache, get_or_create_10ch_atlas_cache
+from parse import parse_method, parser_add_main_args
+from extractor import get_or_create_spectrogram_cache, get_or_create_atlas_cache
 
 
 def fix_seed(seed=42):
@@ -27,77 +27,6 @@ def fix_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
-def get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args):
-    """
-    Check for pre-rasterized multi-channel Ego-Maps cache on disk.
-    If missing, rasterizes all nodes using bounded ego-subgraphs and caches as uint8.
-    """
-    n = dataset.graph['num_nodes']
-    cache_dir = os.path.join(args.data_dir, "ego_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    ch_tag = f"ch{args.channels}_topo"
-    bg_tag = "darkbg" if getattr(args, 'dark_bg', False) else "whitebg"
-    cache_file = os.path.join(
-        cache_dir,
-        f"{args.dataset}_res{args.resolution}_hops{args.num_hops}_max{args.max_nodes}_{args.layout_method}_{ch_tag}_{bg_tag}.pt"
-    )
-
-    if os.path.exists(cache_file):
-        print(f"Loading pre-computed Ego-Map cache from: {cache_file} ...")
-        t0 = time.time()
-        cached_maps = torch.load(cache_file)
-        print(f"Loaded {cached_maps.shape[0]} Ego-Maps in {time.time() - t0:.2f}s | Tensor: {list(cached_maps.shape)} ({cached_maps.dtype})")
-        return cached_maps
-
-    print(f"\n{'='*75}")
-    print(f"Pre-rasterizing {n} multi-channel ({args.channels}ch) Ego-Maps for '{args.dataset}'")
-    print(f"Channels: {args.channels} | White-Anchored: {not getattr(args, 'dark_bg', False)} | Resolution: {args.resolution}x{args.resolution} | Hops: {args.num_hops}")
-    print(f"Cache will be saved to: {cache_file}")
-    print(f"{'='*75}")
-
-    cached_maps = torch.empty((n, args.channels, args.resolution, args.resolution), dtype=torch.uint8)
-    t0 = time.time()
-
-    include_canonical = (args.channels == 8)
-    white_bg = not getattr(args, 'dark_bg', False)
-
-    pbar = tqdm(range(n), desc=f"Rasterizing [{args.dataset}]", unit="node", dynamic_ncols=True)
-    for i in pbar:
-        map_tensor = node_to_ego_map(
-            target_node=i,
-            edge_index=edge_index_cpu,
-            x=x_cpu,
-            num_hops=args.num_hops,
-            resolution=args.resolution,
-            sigma_node=0.05,
-            sigma_edge=0.02,
-            max_nodes=args.max_nodes,
-            layout_method=args.layout_method,
-            include_canonical_matrices=include_canonical,
-            white_bg=white_bg,
-            seed=args.seed + i
-        )
-        # Store as uint8 (0-255) to reduce RAM / disk size by 4x
-        cached_maps[i] = (map_tensor * 255.0).clamp(0, 255).to(torch.uint8)
-
-    # Save to disk
-    torch.save(cached_maps, cache_file)
-    size_mb = (cached_maps.element_size() * cached_maps.nelement()) / (1024 * 1024)
-    print(f"\nRasterization caching complete in {time.time() - t0:.2f}s! Saved {size_mb:.1f} MB to: {cache_file}\n")
-
-    # Save a publication-grade sample visualization panel of Node 0
-    try:
-        results_dir = "./results"
-        os.makedirs(results_dir, exist_ok=True)
-        sample_path = os.path.join(results_dir, f"{args.dataset}_ego_map_sample.png")
-        sample_tensor = (cached_maps[0].float()) / 255.0
-        label_val = int(dataset.label[0].item()) if hasattr(dataset, 'label') else None
-        save_ego_map_panel(sample_tensor, sample_path, target_node_id=0, label=label_val, split_name="sample")
-    except Exception as e:
-        print(f"Note: Could not save sample panel: {e}")
-
-    return cached_maps
 
 
 @torch.no_grad()
@@ -164,39 +93,15 @@ def main():
     x_cpu = dataset.graph['node_feat'].cpu() if dataset.graph['node_feat'] is not None else None
 
     # Pre-rasterize / load representation cache based on --representation flag
-    if getattr(args, 'representation', 'spectrogram') == 'spectrogram':
+    if getattr(args, 'representation', 'atlas') == 'spectrogram':
         cached_maps = get_or_create_spectrogram_cache(dataset, edge_index_cpu, x_cpu, args)
-    elif getattr(args, 'representation', 'spectrogram') in ('atlas', 'atlas_10ch', 'atlas_7ch'):
-        cached_maps = get_or_create_10ch_atlas_cache(dataset, edge_index_cpu, x_cpu, args)
     else:
-        cached_maps = get_or_create_raster_cache(dataset, edge_index_cpu, x_cpu, args)
+        cached_maps = get_or_create_atlas_cache(dataset, edge_index_cpu, x_cpu, args)
 
-    # Move node features to device for training and apply polynomial graph smoothing if enabled
+    # Move node features to device for training
     if dataset.graph['node_feat'] is not None:
-        if not getattr(args, 'no_smooth_features', False) and args.beta > 0 and getattr(args, 'representation', 'spectrogram') == 'ego_map':
-            print(f"Applying Polynomial Graph Feature Smoothing (beta={args.beta}) ...")
-            edge_index = dataset.graph['edge_index']
-            num_nodes = dataset.graph['num_nodes']
-            x = dataset.graph['node_feat']
-
-            # Symmetric normalized adjacency: D^{-1/2} (A + I) D^{-1/2}
-            edge_index_loop, _ = add_self_loops(edge_index, num_nodes=num_nodes)
-            row, col = edge_index_loop[0], edge_index_loop[1]
-            deg = torch.bincount(row, minlength=num_nodes).float()
-            deg_inv_sqrt = torch.pow(deg, -0.5)
-            val = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-            adj_norm = torch.sparse_coo_tensor(edge_index_loop, val, (num_nodes, num_nodes))
-
-            # Multi-step Polynomial Diffusion across local_layers (matching Polynormer's local receptive field)
-            num_steps = getattr(args, 'local_layers', 7)
-            print(f"Applying {num_steps}-step Polynomial Graph Feature Diffusion (beta={args.beta}) ...")
-            x_curr = x.clone()
-            for step in range(num_steps):
-                x_curr = (1.0 - args.beta) * x + args.beta * torch.sparse.mm(adj_norm, x_curr)
-            dataset.graph['node_feat'] = x_curr
-            print(f"-> Node features regularized with {num_steps}-step polynomial neighborhood consensus!")
-
         dataset.graph['node_feat'] = dataset.graph['node_feat'].to(device)
+
 
     ### Instantiate Graph2Map Vision Classifier ###
     model = parse_method(args, n, c, d, device)
@@ -264,7 +169,7 @@ def main():
 
                 # Data Augmentation (D4 dihedral group rotation & flips for spatial channels)
                 if args.augment:
-                    spatial_start = 3 if getattr(args, 'representation', 'spectrogram') in ('atlas', 'atlas_7ch', 'atlas_10ch') else 0
+                    spatial_start = 3 if getattr(args, 'representation', 'atlas') == 'atlas' else 0
                     k = torch.randint(0, 4, (1,)).item()
                     if k > 0:
                         b_maps[:, spatial_start:] = torch.rot90(b_maps[:, spatial_start:], k=k, dims=(-2, -1))

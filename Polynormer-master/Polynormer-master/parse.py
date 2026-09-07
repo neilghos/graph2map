@@ -2,20 +2,18 @@ from model import Graph2MapClassifier, create_vision_model
 
 def parse_method(args, n, c, d, device):
     use_node_feat = not getattr(args, 'no_node_features', False)
-    representation = getattr(args, 'representation', 'spectrogram')
+    representation = getattr(args, 'representation', 'atlas')
 
-    if representation in ('atlas', 'atlas_7ch', 'atlas_10ch'):
-        default_bb = 'egocnn'
-        in_chans = args.channels if args.channels in (7, 10) else 7
-    elif representation == 'spectrogram':
+    if representation == 'spectrogram':
         default_bb = 'spectrogram_cnn'
-        in_chans = args.channels if args.channels in (1, 3, 6) else 3
+        in_chans = 3
     else:
-        default_bb = 'egocnn'
-        in_chans = args.channels if args.channels in (4, 8) else 4
+        # Atlas Master Visual Representation (7 Channels: 3 Spectral + 4 Spatial Cartography)
+        default_bb = 'atlas_net'
+        in_chans = 7
 
     backbone = getattr(args, 'backbone', None)
-    if backbone is None or (backbone == 'spectrogram_cnn' and representation in ('atlas', 'atlas_7ch', 'atlas_10ch', 'ego_map')):
+    if backbone is None or backbone in ('egocnn', 'spectrogram_cnn', 'atlas_net', 'graph_ego_map_net'):
         backbone = default_bb
 
     pretrained = getattr(args, 'pretrained', False)
@@ -35,9 +33,9 @@ def parse_method(args, n, c, d, device):
 
 def parser_add_main_args(parser):
     # representation mode
-    parser.add_argument('--representation', type=str, default='spectrogram',
-                        choices=['spectrogram', 'atlas', 'ego_map'],
-                        help='visual graph representation: spectrogram (Audio-Mel Spectrogram), atlas (7-Channel Spectral+Spatial Master Atlas), or ego_map (Spatial 2D Cartography)')
+    parser.add_argument('--representation', type=str, default='atlas',
+                        choices=['atlas', 'spectrogram'],
+                        help='visual graph representation: atlas (7-Channel Spectral+Spatial Master Atlas, default) or spectrogram (3-Channel Audio-Mel Spectrogram)')
     parser.add_argument('--num_bands', type=int, default=128,
                         help='number of semantic frequency bands for spectrogram (default: 128)')
 
@@ -72,11 +70,7 @@ def parser_add_main_args(parser):
     # Vision Model args
     parser.add_argument('--method', type=str, default='graph2map')
     parser.add_argument('--backbone', type=str, default=None,
-                        help='vision backbone: auto-selected (egocnn for atlas/ego_map, spectrogram_cnn for spectrogram)')
-    parser.add_argument('--channels', type=int, default=3, choices=[1, 3, 4, 6, 7, 8, 10],
-                        help='input channels: 3 (Spectrogram), 7 (Master Atlas: 3 Spectral + 4 Spatial), 4 (Ego-Map)')
-    parser.add_argument('--dark_bg', action='store_true',
-                        help='use legacy dark background instead of default white-anchored high-contrast background')
+                        help='vision backbone: auto-selected (atlas_net for atlas, spectrogram_cnn for spectrogram)')
     parser.add_argument('--pretrained', action='store_true',
                         help='whether to use pretrained vision backbone weights')
     parser.add_argument('--no_node_features', action='store_true',
@@ -84,16 +78,11 @@ def parser_add_main_args(parser):
     parser.add_argument('--hidden_channels', type=int, default=128)
     parser.add_argument('--dropout', type=float, default=0.3)
 
-    # Ego-Map & Spectrogram Parameters
+    # Resolution & Computational Parameters
     parser.add_argument('--resolution', type=int, default=128,
-                        help='canvas resolution for 2D Ego-Map (default 128x128)')
+                        help='canvas resolution for 2D Atlas (default: 128x128)')
     parser.add_argument('--num_hops', type=int, default=8,
-                        help='number of hops for computational neighborhood / spectrogram height (default: 8)')
-    parser.add_argument('--max_nodes', type=int, default=128,
-                        help='max bounded nodes in ego-subgraph')
-    parser.add_argument('--layout_method', type=str, default='concentric',
-                        choices=['concentric', 'pinned_spring'],
-                        help='layout algorithm: concentric (fast polar rings) or pinned_spring')
+                        help='number of hops for computational neighborhood (default: 8)')
     parser.add_argument('--batch_size', type=int, default=128,
                         help='batch size for vision training')
     parser.add_argument('--eval_batch_size', type=int, default=256,
@@ -117,5 +106,3 @@ def parser_add_main_args(parser):
     parser.add_argument('--save_model', action='store_true', help='whether to save model')
     parser.add_argument('--model_dir', type=str, default='./model/', help='where to save model')
     parser.add_argument('--save_result', action='store_true', help='whether to save result')
-
-
