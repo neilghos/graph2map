@@ -106,3 +106,4 @@ def parser_add_main_args(parser):
     parser.add_argument('--save_model', action='store_true', help='whether to save model')
     parser.add_argument('--model_dir', type=str, default='./model/', help='where to save model')
     parser.add_argument('--save_result', action='store_true', help='whether to save result')
+    parser.add_argument('--save_filename', type=str, default=None, help='custom CSV filename to save benchmark results')

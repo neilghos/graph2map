@@ -78,24 +78,25 @@ def compute_graph_spectrograms(
     x = x.float()
     num_raw_feats = x.shape[1]
 
-    # Filterbank: Select top variance frequency bands
+    # Filterbank: Select top variance frequency bands (stable sort)
     if num_bands > 0 and num_bands < num_raw_feats:
         feat_var = torch.var(x, dim=0).cpu().numpy()
-        band_indices = np.argsort(-feat_var)[:num_bands]
-        x_sub = x[:, band_indices].to(device)
+        band_indices = np.argsort(-feat_var, kind='stable')[:num_bands]
+        x_sub = x[:, band_indices].cpu()
     else:
         num_bands = num_raw_feats
         band_indices = np.arange(num_raw_feats)
-        x_sub = x.to(device)
+        x_sub = x.cpu()
 
-    # Symmetric normalized adjacency: D^{-1/2} (A + I) D^{-1/2}
-    edge_index_loop, _ = add_self_loops(edge_index.to(device), num_nodes=num_nodes)
+    # Symmetric normalized adjacency on CPU: D^{-1/2} (A + I) D^{-1/2}
+    edge_index_cpu = edge_index.cpu()
+    edge_index_loop, _ = add_self_loops(edge_index_cpu, num_nodes=num_nodes)
     row, col = edge_index_loop[0], edge_index_loop[1]
     deg = torch.bincount(row, minlength=num_nodes).float()
     deg_inv_sqrt = torch.pow(deg, -0.5)
     deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
     val = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-    adj_norm = torch.sparse_coo_tensor(edge_index_loop, val, (num_nodes, num_nodes)).to(device)
+    adj_norm = torch.sparse_coo_tensor(edge_index_loop, val, (num_nodes, num_nodes)).coalesce()
 
     s0_hops, s1_hops, s2_hops = [], [], []
     x_k = x_sub
@@ -155,6 +156,7 @@ def compute_ego_layout_fast(
     num_sub_nodes: int,
     sub_edge_index: torch.Tensor,
     target_idx: int,
+    subset_global: torch.Tensor = None,
     max_hop: int = 2,
     permute_seed: int = None
 ) -> tuple[torch.Tensor, list[int]]:
@@ -167,11 +169,17 @@ def compute_ego_layout_fast(
     if num_sub_nodes <= 1:
         return coords, [0]
 
-    # Fast BFS hop distance
+    # Fast BFS hop distance with deterministic sorted adjacency
     adj = [[] for _ in range(num_sub_nodes)]
     edges_list = sub_edge_index.t().tolist()
     for u, v in edges_list:
         adj[u].append(v)
+
+    for u in range(num_sub_nodes):
+        if subset_global is not None:
+            adj[u].sort(key=lambda n: subset_global[n].item())
+        else:
+            adj[u].sort()
 
     hop_dist = [-1] * num_sub_nodes
     hop_dist[target_idx] = 0
@@ -188,6 +196,10 @@ def compute_ego_layout_fast(
     radii = [0.0, 0.38, 0.72]
     for h in range(1, max_hop + 1):
         nodes_h = [i for i, d in enumerate(hop_dist) if d == h]
+        if subset_global is not None:
+            nodes_h.sort(key=lambda n: subset_global[n].item())
+        else:
+            nodes_h.sort()
         n_h = len(nodes_h)
         if n_h > 0:
             if rng is not None and n_h > 1:
@@ -199,6 +211,10 @@ def compute_ego_layout_fast(
                 coords[node, 1] = r * np.sin(angle)
 
     unreach = [i for i, d in enumerate(hop_dist) if d == -1 or d > max_hop]
+    if subset_global is not None:
+        unreach.sort(key=lambda n: subset_global[n].item())
+    else:
+        unreach.sort()
     n_u = len(unreach)
     if n_u > 0:
         if rng is not None and n_u > 1:
@@ -224,7 +240,7 @@ def compute_spatial_ppr_fast(
     deg = torch.bincount(sub_edge_index[0], minlength=num_sub_nodes).float()
     deg_inv = torch.where(deg > 0, 1.0 / deg, torch.zeros_like(deg))
     val = deg_inv[sub_edge_index[0]]
-    P = torch.sparse_coo_tensor(sub_edge_index, val, (num_sub_nodes, num_sub_nodes)).to_dense()
+    P = torch.sparse_coo_tensor(sub_edge_index, val, (num_sub_nodes, num_sub_nodes)).coalesce().to_dense()
 
     e_target = torch.zeros((num_sub_nodes,), dtype=torch.float32)
     e_target[target_idx] = 1.0
@@ -268,11 +284,11 @@ def extract_node_4ch_spatial_fast(
     target_idx = mapping.item()
     sub_x = x[subset] if x is not None else None
 
-    # Bounded neighborhood for crisp visualization & speed
+    # Bounded neighborhood with deterministic tie-breaking by global node ID
     if num_sub_nodes > max_nodes:
         deg = torch.bincount(sub_edge_index[0], minlength=num_sub_nodes)
-        nbrs = sub_edge_index[1][sub_edge_index[0] == target_idx].unique().tolist()
-        sorted_nbrs = sorted(nbrs, key=lambda n: deg[n].item(), reverse=True)
+        nbrs = sub_edge_index[1][sub_edge_index[0] == target_idx].unique(sorted=True).tolist()
+        sorted_nbrs = sorted(nbrs, key=lambda n: (-deg[n].item(), subset[n].item()))
         keep = [target_idx] + sorted_nbrs[:max_nodes - 1]
         keep_tensor = torch.tensor(keep, dtype=torch.long)
         new_map = torch.full((num_sub_nodes,), -1, dtype=torch.long)
@@ -280,13 +296,17 @@ def extract_node_4ch_spatial_fast(
         mask = (new_map[sub_edge_index[0]] >= 0) & (new_map[sub_edge_index[1]] >= 0)
         sub_edge_index = torch.stack([new_map[sub_edge_index[0][mask]], new_map[sub_edge_index[1][mask]]], dim=0)
         sub_x = sub_x[keep_tensor] if sub_x is not None else None
+        subset = subset[keep_tensor]
         target_idx = 0
         num_sub_nodes = len(keep)
 
     dev = grid.device
 
-    # 1. Concentric Layout (with optional GraphAug isomorphic permutation)
-    coords, hop_dist = compute_ego_layout_fast(num_sub_nodes, sub_edge_index, target_idx, max_hop=num_hops, permute_seed=permute_seed)
+    # 1. Concentric Layout (with canonical tie-breaking & optional GraphAug isomorphic permutation)
+    coords, hop_dist = compute_ego_layout_fast(
+        num_sub_nodes, sub_edge_index, target_idx,
+        subset_global=subset, max_hop=num_hops, permute_seed=permute_seed
+    )
     coords_dev = coords.to(dev)
 
     # 2. Vectorized Node Distance Field: (H, W, N) on dev
@@ -451,7 +471,7 @@ def get_or_create_atlas_cache(dataset, edge_index_cpu, x_cpu, args) -> torch.Ten
     t0 = time.time()
     device = torch.device(f"cuda:{args.device}" if (torch.cuda.is_available() and not getattr(args, 'cpu', False)) else "cpu")
 
-    # Step 1: Compute high-contrast 3-channel spectrograms globally (<0.3s)
+    # Step 1: Compute high-contrast 3-channel spectrograms globally on CPU (100% deterministic)
     print("Step 1/2: Computing global high-contrast 3-channel spectrograms...")
     all_specs, _ = compute_graph_spectrograms(
         edge_index=edge_index_cpu,
@@ -459,7 +479,7 @@ def get_or_create_atlas_cache(dataset, edge_index_cpu, x_cpu, args) -> torch.Ten
         num_nodes=n,
         num_hops=num_hops,
         num_bands=effective_bands,
-        device=device
+        device=torch.device('cpu')
     )
 
     # Discrete Hop Block Expansion (zero inter-hop vertical bleed)
@@ -548,7 +568,7 @@ def get_or_create_spectrogram_cache(dataset, edge_index_cpu, x_cpu, args) -> tor
 
     device = torch.device(f"cuda:{args.device}" if (torch.cuda.is_available() and not getattr(args, 'cpu', False)) else "cpu")
     specs_float, _ = compute_graph_spectrograms(
-        edge_index=edge_index_cpu, x=x_cpu, num_nodes=n, num_hops=num_hops, num_bands=effective_bands, device=device
+        edge_index=edge_index_cpu, x=x_cpu, num_nodes=n, num_hops=num_hops, num_bands=effective_bands, device=torch.device('cpu')
     )
     if channels < specs_float.shape[1]:
         specs_float = specs_float[:, :channels, :, :]

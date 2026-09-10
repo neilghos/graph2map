@@ -14,7 +14,6 @@ from dataset import load_dataset
 from data_utils import eval_acc, eval_rocauc, load_fixed_splits
 from eval import *
 from parse import parse_method, parser_add_main_args
-from parse import parse_method, parser_add_main_args
 from extractor import get_or_create_spectrogram_cache, get_or_create_atlas_cache
 
 
@@ -128,10 +127,11 @@ def main():
 
     ### Training loop ###
     for run in range(args.runs):
+        fix_seed(args.seed + run)
         if args.dataset in ('coauthor-cs', 'coauthor-physics', 'amazon-computer', 'amazon-photo'):
             split_idx = split_idx_lst[0]
         else:
-            split_idx = split_idx_lst[run]
+            split_idx = split_idx_lst[run % len(split_idx_lst)]
 
         train_idx = split_idx['train']
         model.reset_parameters()

@@ -91,7 +91,14 @@ def load_model(args, model, optimizer, run):
 def save_result(args, results):
     if not os.path.exists(f'results/{args.dataset}'):
         os.makedirs(f'results/{args.dataset}')
-    filename = f'results/{args.dataset}/{args.method}.csv'
+
+    if getattr(args, 'save_filename', None):
+        filename = f'results/{args.dataset}/{args.save_filename}'
+    elif getattr(args, 'runs', 1) > 1:
+        filename = f'results/{args.dataset}/{args.dataset}_{args.runs}seeds.csv'
+    else:
+        filename = f'results/{args.dataset}/{args.method}.csv'
+
     print(f"\nSaved benchmark results to {filename}")
     std_str = f"± {results.std():.2f}" if results.numel() > 1 else "± 0.00"
     with open(f"{filename}", 'a+') as write_obj:
