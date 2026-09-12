@@ -135,12 +135,24 @@ def main():
 
         train_idx = split_idx['train']
         model.reset_parameters()
-        optimizer = torch.optim.Adam(model.parameters(), weight_decay=args.weight_decay, lr=args.lr)
+        optimizer = torch.optim.AdamW(model.parameters(), weight_decay=args.weight_decay, lr=args.lr)
         scheduler = None
         if args.cosine_lr:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=total_epochs, eta_min=args.lr * 0.01
-            )
+            warmup_epochs = getattr(args, 'warmup_epochs', 5)
+            if warmup_epochs > 0 and total_epochs > warmup_epochs:
+                warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.05, end_factor=1.0, total_iters=warmup_epochs
+                )
+                cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=total_epochs - warmup_epochs, eta_min=args.lr * 0.01
+                )
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs]
+                )
+            else:
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=total_epochs, eta_min=args.lr * 0.01
+                )
         best_val = float('-inf')
         best_test = float('-inf')
 
@@ -161,9 +173,12 @@ def main():
             for b_start in batch_pbar:
                 b_idx = shuffled_train[b_start:b_start + args.batch_size]
                 if cached_maps.dim() == 5:
-                    num_vars = cached_maps.size(1)
-                    var_idx = torch.randint(0, num_vars, (len(b_idx),))
-                    b_maps = (cached_maps[b_idx, var_idx].to(device).float()) / 255.0
+                    if args.augment:
+                        num_vars = cached_maps.size(1)
+                        var_idx = torch.randint(0, num_vars, (len(b_idx),))
+                        b_maps = (cached_maps[b_idx, var_idx].to(device).float()) / 255.0
+                    else:
+                        b_maps = (cached_maps[b_idx, 0].to(device).float()) / 255.0
                 else:
                     b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
 

@@ -46,7 +46,7 @@ def parser_add_main_args(parser):
                         help='which gpu to use if any (default: 0)')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--cpu', action='store_true')
-    parser.add_argument('--epochs', type=int, default=100,
+    parser.add_argument('--epochs', type=int, default=300,
                         help='total training epochs for vision model')
     parser.add_argument('--local_epochs', type=int, default=50,
                         help='kept for compatibility with original scripts')
@@ -76,7 +76,7 @@ def parser_add_main_args(parser):
     parser.add_argument('--no_node_features', action='store_true',
                         help='disable fusing raw target node features (pure vision mode)')
     parser.add_argument('--hidden_channels', type=int, default=128)
-    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--dropout', type=float, default=0.5)
 
     # Resolution & Computational Parameters
     parser.add_argument('--resolution', type=int, default=128,
@@ -86,15 +86,17 @@ def parser_add_main_args(parser):
     parser.add_argument('--batch_size', type=int, default=128,
                         help='batch size for vision training')
     parser.add_argument('--eval_batch_size', type=int, default=256,
-                        help='batch size for evaluation inference')
+                        help='batch size for evaluation inference (default: 256)')
 
     # training
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--augment', action='store_true',
                         help='apply random rotation (0, 90, 180, 270 deg) and flip data augmentation to spatial channels')
-    parser.add_argument('--label_smoothing', type=float, default=0.1,
+    parser.add_argument('--label_smoothing', type=float, default=0.0,
                         help='label smoothing epsilon for cross entropy loss (default: 0.1)')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                        help='number of warmup epochs for learning rate scheduler (default: 5)')
     parser.add_argument('--cosine_lr', action='store_true', default=True,
                         help='use cosine annealing learning rate scheduler (default: True)')
     parser.add_argument('--no_cosine_lr', dest='cosine_lr', action='store_false',
