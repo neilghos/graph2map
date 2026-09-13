@@ -16,20 +16,26 @@ class Logger(object):
         assert run >= 0 and run < len(self.results)
         self.results[run].append(result)
 
-    def print_statistics(self, run=None, mode='max_acc'):
+    def print_statistics(self, run=None, mode='max_acc', burn_in_ratio=0.0, last_epochs=10):
         if run is not None:
             result = 100 * torch.tensor(self.results[run])
-            argmax = result[:, 1].argmax().item()
-            argmin = result[:, 3].argmin().item()
-            if mode == 'max_acc':
-                ind = argmax
+            if last_epochs > 0 and len(result) >= last_epochs:
+                start_idx = len(result) - last_epochs
+                tail_str = f' (Selected from final {last_epochs} annealed epochs: {start_idx}..{len(result)-1})'
             else:
-                ind = argmin
+                start_idx = int(len(result) * burn_in_ratio)
+                tail_str = f' (Burn-in: >= epoch {start_idx})' if start_idx > 0 else ''
+
+            if mode == 'max_acc':
+                ind = start_idx + result[start_idx:, 1].argmax().item()
+            else:
+                ind = start_idx + result[start_idx:, 3].argmin().item()
+
             print(f'Run {run + 1:02d}:')
             print(f'Highest Train: {result[:, 0].max():.2f}%')
-            print(f'Highest Valid: {result[:, 1].max():.2f}%')
+            print(f'Highest Valid: {result[:, 1].max():.2f}% (Annealed Tail Best: {result[start_idx:, 1].max():.2f}%)')
             print(f'Highest Test:  {result[:, 2].max():.2f}%')
-            print(f'Chosen epoch:  {ind}')
+            print(f'Chosen epoch:  {ind}{tail_str}')
             print(f'Final Train:   {result[ind, 0]:.2f}%')
             print(f'Final Test:    {result[ind, 2]:.2f}%')
             self.test = result[ind, 2]
@@ -37,15 +43,22 @@ class Logger(object):
             best_results = []
             for r in self.results:
                 r = 100 * torch.tensor(r)
+                if last_epochs > 0 and len(r) >= last_epochs:
+                    start_idx = len(r) - last_epochs
+                else:
+                    start_idx = int(len(r) * burn_in_ratio) if burn_in_ratio > 0 else 0
+
                 train1 = r[:, 0].max().item()
-                valid = r[:, 1].max().item()
+                valid = r[start_idx:, 1].max().item()
                 test1 = r[:, 2].max().item()
                 if mode == 'max_acc':
-                    train2 = r[r[:, 1].argmax(), 0].item()
-                    test2 = r[r[:, 1].argmax(), 2].item()
+                    best_idx = start_idx + r[start_idx:, 1].argmax().item()
+                    train2 = r[best_idx, 0].item()
+                    test2 = r[best_idx, 2].item()
                 else:
-                    train2 = r[r[:, 3].argmin(), 0].item()
-                    test2 = r[r[:, 3].argmin(), 2].item()
+                    best_idx = start_idx + r[start_idx:, 3].argmin().item()
+                    train2 = r[best_idx, 0].item()
+                    test2 = r[best_idx, 2].item()
                 best_results.append((train1, test1, valid, train2, test2))
 
             best_result = torch.tensor(best_results)

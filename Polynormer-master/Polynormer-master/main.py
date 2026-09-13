@@ -225,18 +225,31 @@ def main():
 
             logger.add_result(run, result[:-1])
 
-            if result[1] > best_val:
-                best_val = result[1]
-                best_test = result[2]
-                if args.save_model:
-                    save_model(args, model, optimizer, run)
+            last_epochs = getattr(args, 'last_epochs', 10)
+            if last_epochs > 0 and total_epochs >= last_epochs:
+                eligible_epoch = total_epochs - last_epochs
+                phase_tag = f" [Pre-Tail {epoch+1}/{eligible_epoch}]" if epoch < eligible_epoch else " [Annealed Tail]"
+            else:
+                burn_in_ratio = getattr(args, 'burn_in_ratio', 0.3)
+                eligible_epoch = int(total_epochs * burn_in_ratio)
+                phase_tag = f" [Burn-in {epoch+1}/{eligible_epoch}]" if epoch < eligible_epoch else ""
+
+            if epoch >= eligible_epoch:
+                if result[1] > best_val:
+                    best_val = result[1]
+                    best_test = result[2]
+                    if args.save_model:
+                        save_model(args, model, optimizer, run)
+
+            disp_val = best_val if best_val != float('-inf') else result[1]
+            disp_test = best_test if best_test != float('-inf') else result[2]
 
             # Update epoch progress bar status
             epoch_pbar.set_postfix({
                 'loss': f"{epoch_loss:.4f}",
                 'val_acc': f"{100 * result[1]:.2f}%",
                 'test_acc': f"{100 * result[2]:.2f}%",
-                'best_test': f"{100 * best_test:.2f}%"
+                'best_test': f"{100 * disp_test:.2f}%" + phase_tag
             })
 
             if epoch % args.display_step == 0:
@@ -246,13 +259,20 @@ def main():
                     f'Train: {100 * result[0]:.2f}% | '
                     f'Valid: {100 * result[1]:.2f}% | '
                     f'Test: {100 * result[2]:.2f}% | '
-                    f'Best Valid: {100 * best_val:.2f}% | '
-                    f'Best Test: {100 * best_test:.2f}%'
+                    f'Best Valid: {100 * disp_val:.2f}% | '
+                    f'Best Test: {100 * disp_test:.2f}%{phase_tag}'
                 )
 
-        logger.print_statistics(run)
+        logger.print_statistics(
+            run,
+            burn_in_ratio=getattr(args, 'burn_in_ratio', 0.3),
+            last_epochs=getattr(args, 'last_epochs', 10)
+        )
 
-    results = logger.print_statistics()
+    results = logger.print_statistics(
+        burn_in_ratio=getattr(args, 'burn_in_ratio', 0.3),
+        last_epochs=getattr(args, 'last_epochs', 10)
+    )
     ### Save results ###
     save_result(args, results)
 

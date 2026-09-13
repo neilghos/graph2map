@@ -101,6 +101,10 @@ def parser_add_main_args(parser):
                         help='use cosine annealing learning rate scheduler (default: True)')
     parser.add_argument('--no_cosine_lr', dest='cosine_lr', action='store_false',
                         help='disable cosine annealing scheduler')
+    parser.add_argument('--burn_in_ratio', type=float, default=0.3,
+                        help='fraction of initial epochs to skip before considering validation checkpoints (default: 0.3)')
+    parser.add_argument('--last_epochs', type=int, default=10,
+                        help='select checkpoint based on best validation score in the final N annealed epochs (default: 10)')
 
     # display and utility
     parser.add_argument('--display_step', type=int,

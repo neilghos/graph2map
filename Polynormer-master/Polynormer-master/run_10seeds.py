@@ -5,7 +5,7 @@ import argparse
 def main():
     parser = argparse.ArgumentParser(description="10-Seed Benchmark Runner for Graph2Map")
     parser.add_argument('--dataset', type=str, default='amazon-photo')
-    parser.add_argument('--runs', type=int, default=10)
+    parser.add_argument('--runs', type=int, default=5)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--epochs', type=int, default=100)
     args, unknown = parser.parse_known_args()
