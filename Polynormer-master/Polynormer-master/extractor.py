@@ -30,29 +30,47 @@ from dataset import load_dataset
 
 
 # =============================================================================
-# 1. COLORMAPS (Zero Matplotlib Dependency)
+# 1. COLORMAPS: Genuine 256-Color Matplotlib Magma LUT (Librosa Standard)
 # =============================================================================
 
-def apply_colormap(matrix: np.ndarray, colormap: str = "magma") -> np.ndarray:
-    """Map a 2D float matrix in [0, 1] to an (H, W, 3) RGB uint8 image using PIL-compatible colormaps."""
-    v = np.clip(matrix, 0.0, 1.0)
-    if colormap == "magma":
-        r = np.clip(1.4 * (v ** 0.65) - 0.3 * (v ** 3), 0.0, 1.0)
-        g = np.clip(1.25 * (v ** 1.8) + 0.1 * (v ** 4), 0.0, 1.0)
-        b = np.clip(0.4 * (v ** 0.5) + 0.6 * (v ** 2.5), 0.0, 1.0)
-    elif colormap == "inferno":
-        r = np.clip(1.5 * (v ** 0.8) - 0.2 * (v ** 3), 0.0, 1.0)
-        g = np.clip(1.1 * (v ** 1.6), 0.0, 1.0)
-        b = np.clip(0.3 * np.sin(np.pi * v) + 0.9 * (v ** 3), 0.0, 1.0)
-    elif colormap == "viridis":
-        r = np.clip(0.1 + 0.9 * (v ** 1.5), 0.0, 1.0)
-        g = np.clip(0.2 + 0.8 * (v ** 0.8), 0.0, 1.0)
-        b = np.clip(0.5 * (1.0 - v) + 0.2 * (v ** 2), 0.0, 1.0)
-    else:
-        r = g = b = v
+try:
+    import matplotlib
+    import matplotlib.cm as cm
+    try:
+        _cmap_magma = matplotlib.colormaps['magma']
+    except Exception:
+        _cmap_magma = cm.get_cmap('magma')
+    _MAGMA_LUT = (_cmap_magma(np.linspace(0.0, 1.0, 256))[:, :3] * 255.0).astype(np.uint8)
+except Exception:
+    # High-precision 11-knot piecewise linear interpolation matching official Matplotlib Magma
+    _magma_knots_pos = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+    _magma_knots_rgb = np.array([
+        [0, 0, 4],        # #000004
+        [20, 14, 54],     # #140e36
+        [59, 15, 112],    # #3b0f70
+        [100, 26, 128],   # #641a80
+        [140, 41, 129],   # #8c2981
+        [183, 55, 121],   # #b73779
+        [222, 73, 104],   # #de4968
+        [247, 112, 92],   # #f7705c
+        [254, 159, 109],  # #fe9f6d
+        [254, 207, 146],  # #fecf92
+        [252, 253, 191]   # #fcfdbf
+    ], dtype=np.float32)
+    _x_steps = np.linspace(0.0, 1.0, 256)
+    _MAGMA_LUT = np.zeros((256, 3), dtype=np.uint8)
+    for _ch in range(3):
+        _MAGMA_LUT[:, _ch] = np.clip(np.interp(_x_steps, _magma_knots_pos, _magma_knots_rgb[:, _ch]), 0, 255).astype(np.uint8)
 
-    rgb = np.stack([r, g, b], axis=-1)
-    return (rgb * 255.0).astype(np.uint8)
+
+def apply_colormap(matrix: np.ndarray, colormap: str = "magma") -> np.ndarray:
+    """
+    Map a 2D float matrix in [0, 1] to an (H, W, 3) RGB uint8 image using the genuine 256-color Magma LUT.
+    Vectorized, sub-millisecond lookup matching Librosa log-mel visualizations.
+    """
+    v = np.clip(matrix, 0.0, 1.0)
+    indices = (v * 255.0).astype(np.int32)
+    return _MAGMA_LUT[indices]
 
 
 # =============================================================================
@@ -125,20 +143,31 @@ def compute_graph_spectrograms(
     c1 = torch.stack(s1_hops, dim=0).permute(1, 0, 2)  # (N, num_hops, num_bands)
     c2 = torch.stack(s2_hops, dim=0).permute(1, 0, 2)  # (N, num_hops, num_bands)
 
-    # 1. Ch 0 (Low-pass consensus): Per-node dynamic range stretch [0, 1]
+    # Log-Mel Dynamic Range Compression: log(1 + gamma * S) / log(1 + gamma)
+    # Elevates diffused multi-hop energy (Hops 1-7) without allowing Hop 0 binary spikes to dominate
+    gamma_spec = 20.0
+    log_denom = float(np.log(1.0 + gamma_spec))
+
+    # 1. Ch 0 (Low-pass Community Consensus): Log-Mel dynamic range compression
     c0_min = c0.amin(dim=(1, 2), keepdim=True)
-    c0_max = c0.amax(dim=(1, 2), keepdim=True)
-    c0_norm = (c0 - c0_min) / (c0_max - c0_min + 1e-6)
+    c0_zeroed = torch.clamp(c0 - c0_min, min=0.0)
+    c0_max = c0_zeroed.amax(dim=(1, 2), keepdim=True)
+    c0_scaled = c0_zeroed / (c0_max + 1e-6)
+    c0_norm = torch.log1p(gamma_spec * c0_scaled) / log_denom
 
-    # 2. Ch 1 (High-pass boundary heterophily): Per-node symmetric contrast centered at 0.5
-    # Absolute zero gradient is anchored at 0.5, with positive/negative departures scaled to full contrast
+    # 2. Ch 1 (High-pass Boundary Gradient): Sign-preserving symmetric log compression
+    # Centered at 0.5 baseline; subtle positive/negative gradients are dynamically amplified
     c1_mag = torch.abs(c1).amax(dim=(1, 2), keepdim=True)
-    c1_norm = torch.where(c1_mag > 1e-6, (c1 / c1_mag) * 0.5 + 0.5, torch.full_like(c1, 0.5))
+    c1_scaled = torch.where(c1_mag > 1e-6, torch.abs(c1) / c1_mag, torch.zeros_like(c1))
+    c1_log = torch.log1p(gamma_spec * c1_scaled) / log_denom
+    c1_norm = torch.sign(c1) * c1_log * 0.5 + 0.5
 
-    # 3. Ch 2 (Structural PageRank resonance): Per-node dynamic range stretch [0, 1]
+    # 3. Ch 2 (Structural PageRank Resonance): Log-Mel dynamic range compression
     c2_min = c2.amin(dim=(1, 2), keepdim=True)
-    c2_max = c2.amax(dim=(1, 2), keepdim=True)
-    c2_norm = (c2 - c2_min) / (c2_max - c2_min + 1e-6)
+    c2_zeroed = torch.clamp(c2 - c2_min, min=0.0)
+    c2_max = c2_zeroed.amax(dim=(1, 2), keepdim=True)
+    c2_scaled = c2_zeroed / (c2_max + 1e-6)
+    c2_norm = torch.log1p(gamma_spec * c2_scaled) / log_denom
 
     spectrograms = torch.stack([c0_norm, c1_norm, c2_norm], dim=1).cpu()
 
@@ -385,16 +414,13 @@ def save_atlas_panel(
 
     header = f"7-CHANNEL MASTER GRAPH VISUAL ATLAS: NODE #{target_node_id} (CLASS {label}) ON [{dataset_name.upper()}]"
     draw.text((20, 15), header, fill=(255, 255, 255))
-    draw.text((20, 38), "Row 1: 3 Calibrated Spectral Channels (Exact Hop Blocks) | Row 2: 4 Razor-Sharp Spatial Fields", fill=(160, 175, 195))
+    draw.text((20, 38), "Standardized Librosa Log-Mel Magma Palette | Row 1: 3 Log-Mel Spectral Dynamics | Row 2: 4 Spatial Topological Fields", fill=(160, 175, 195))
 
-    colormaps = [
-        "magma", "inferno", "viridis",
-        "magma", "inferno", "magma", "viridis"
-    ]
+    colormaps = ["magma"] * 7
     titles = [
-        "Ch 0: Spectral Consensus (A^k X)",
-        "Ch 1: Boundary Gradient (Delta A^k X)",
-        "Ch 2: Spectral PageRank (PPR)",
+        "Ch 0: Log-Mel Consensus (A^k X)",
+        "Ch 1: Log-Mel Boundary Gradient (Delta A^k X)",
+        "Ch 2: Log-Mel PageRank Resonance (PPR)",
         "Ch 3: Spatial Ego Density Field",
         "Ch 4: Subgraph Edge Line Flux",
         "Ch 5: Spatial PPR Heat Return",
@@ -429,13 +455,17 @@ save_10ch_panel = save_atlas_panel
 
 
 # =============================================================================
-# 5. ULTRA-FAST CACHING ENGINE (<30s for Entire Dataset)
+# 5. MASTER ATLASTER & CACHE MANAGER (Atlas 7-Channel + GraphAug 3x)
 # =============================================================================
 
-def get_or_create_atlas_cache(dataset, edge_index_cpu, x_cpu, args) -> torch.Tensor:
+def get_or_create_atlas_cache(
+    dataset,
+    edge_index_cpu: torch.Tensor,
+    x_cpu: torch.Tensor,
+    args
+) -> torch.Tensor:
     """
-    Ultra-fast caching of 7-Channel Master Visual Atlas on disk.
-    Executes in <30 seconds for 7650 nodes via vectorized tensor operations.
+    Retrieves or constructs the master 7-Channel Log-Mel Visual Atlas cache with GraphAug 3x permutations.
     """
     n = dataset.graph['num_nodes']
     cache_dir = os.path.join(args.data_dir, "atlas_cache")
@@ -450,20 +480,20 @@ def get_or_create_atlas_cache(dataset, edge_index_cpu, x_cpu, args) -> torch.Ten
     num_variants = 3
     cache_file = os.path.join(
         cache_dir,
-        f"{args.dataset}_atlas7ch_graphaug{num_variants}x_res{resolution}_hops{num_hops}_bands{effective_bands}.pt"
+        f"{args.dataset}_atlas7ch_logmel_graphaug{num_variants}x_res{resolution}_hops{num_hops}_bands{effective_bands}.pt"
     )
 
     if os.path.exists(cache_file):
-        print(f"Loading pre-computed 7-Channel GraphAug {num_variants}x Visual Atlas cache from: {cache_file} ...")
+        print(f"Loading pre-computed 7-Channel Log-Mel GraphAug {num_variants}x Visual Atlas cache from: {cache_file} ...")
         t0 = time.time()
         cached_atlas = torch.load(cache_file)
         print(f"Loaded {cached_atlas.shape[0]} Visual Atlases ({num_variants} isomorphic variants) in {time.time() - t0:.2f}s | Tensor: {list(cached_atlas.shape)} ({cached_atlas.dtype})")
         return cached_atlas
 
     print(f"\n{'='*75}")
-    print(f"Generating 7-Channel Master Visual Atlas with GraphAug ({num_variants}x Isomorphic Permutations)")
+    print(f"Generating 7-Channel Master Visual Atlas with Log-Mel Dynamic Range & GraphAug ({num_variants}x Isomorphic Permutations)")
     print(f"Dataset: '{args.dataset}' ({n} nodes) | Canvas: 7 x {resolution}x{resolution} x {num_variants} variants")
-    print(f"Representation: High-Contrast Spectrograms + Permutation-Invariant Spatial Cartography")
+    print(f"Representation: Log-Mel Spectrograms + Permutation-Invariant Spatial Cartography")
     print(f"Engine: GPU Tensor-Core Accelerated Vectorization (<40s total runtime)")
     print(f"Cache will be saved to: {cache_file}")
     print(f"{'='*75}")
