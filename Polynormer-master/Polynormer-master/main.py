@@ -173,25 +173,9 @@ def main():
             for b_start in batch_pbar:
                 b_idx = shuffled_train[b_start:b_start + args.batch_size]
                 if cached_maps.dim() == 5:
-                    if args.augment:
-                        num_vars = cached_maps.size(1)
-                        var_idx = torch.randint(0, num_vars, (len(b_idx),))
-                        b_maps = (cached_maps[b_idx, var_idx].to(device).float()) / 255.0
-                    else:
-                        b_maps = (cached_maps[b_idx, 0].to(device).float()) / 255.0
+                    b_maps = (cached_maps[b_idx, 0].to(device).float()) / 255.0
                 else:
                     b_maps = (cached_maps[b_idx].to(device).float()) / 255.0
-
-                # Data Augmentation (D4 dihedral group rotation & flips for spatial channels)
-                if args.augment:
-                    spatial_start = 3 if getattr(args, 'representation', 'atlas') == 'atlas' else 0
-                    k = torch.randint(0, 4, (1,)).item()
-                    if k > 0:
-                        b_maps[:, spatial_start:] = torch.rot90(b_maps[:, spatial_start:], k=k, dims=(-2, -1))
-                    if torch.rand(1).item() > 0.5:
-                        b_maps[:, spatial_start:] = torch.flip(b_maps[:, spatial_start:], dims=[-1])
-                    if torch.rand(1).item() > 0.5:
-                        b_maps[:, spatial_start:] = torch.flip(b_maps[:, spatial_start:], dims=[-2])
 
                 b_feats = dataset.graph['node_feat'][b_idx] if not args.no_node_features else None
                 b_targets = dataset.label.squeeze(1)[b_idx.to(device)]

@@ -91,8 +91,6 @@ def parser_add_main_args(parser):
     # training
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
-    parser.add_argument('--augment', action='store_true',
-                        help='apply random rotation (0, 90, 180, 270 deg) and flip data augmentation to spatial channels')
     parser.add_argument('--label_smoothing', type=float, default=0.0,
                         help='label smoothing epsilon for cross entropy loss (default: 0.1)')
     parser.add_argument('--warmup_epochs', type=int, default=5,
