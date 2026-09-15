@@ -1,36 +1,33 @@
-# Byte-compiled / optimized / DLL files
+# Ignore everything by default
+*
+
+# Whitelist directories so Git can recurse into subdirectories
+!*/
+
+# Whitelist .gitignore
+!.gitignore
+
+# Whitelist all Python source files
+!*.py
+!**/*.py
+
+# Explicit exclusions for caches, temporary datasets, and compiled artifacts
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
-
-# PyTorch weights, checkpoints, and raster caches
 *.pt
 *.pth
 *.pkl
-ego_cache/
-**/ego_cache/
-ego_maps_output/
-models/
-**/models/
-*.md
-
-# Datasets
-**/data/
-!**/data/.gitkeep
-
-# Sample exports / PNGs
-*.png
-!results/amazon-photo_ego_map_sample.png
-
-# Environments & IDE
-.env
-.venv
+cache/
+**/cache/
+datasets/
+**/datasets/
+check_point/
+**/check_point/
+Log_Info/
+**/Log_Info/
+.venv/
 env/
-venv/
 .vscode/
 .idea/
-
-# OS artifacts
-Thumbs.db
-Desktop.ini
-.DS_Store
