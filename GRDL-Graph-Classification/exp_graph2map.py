@@ -104,27 +104,36 @@ class Graph2MapResNet(nn.Module):
 # 2. DATASET RASTERIZATION AND CACHING
 # =============================================================================
 
-def get_or_create_rasterized_maps(dataset, dataset_name: str, resolution: int = 64, layout: str = "spring", cache_dir: str = "./cache"):
+def get_or_create_rasterized_maps(
+    dataset,
+    dataset_name: str,
+    resolution: int = 64,
+    layout: str = "spring",
+    include_spectrogram: bool = True,
+    cache_dir: str = "./cache"
+):
     os.makedirs(cache_dir, exist_ok=True)
-    cache_path = os.path.join(cache_dir, f"{dataset_name}_res{resolution}_{layout}_5ch.pt")
+    ch_tag = "8ch" if include_spectrogram else "5ch"
+    cache_path = os.path.join(cache_dir, f"{dataset_name}_res{resolution}_{layout}_{ch_tag}.pt")
 
     if os.path.exists(cache_path):
         print(f"[*] Loading pre-rasterized {dataset_name} maps from cache: {cache_path}")
         cache_data = torch.load(cache_path)
         return cache_data['X'], cache_data['Y']
 
-    print(f"[*] Pre-rasterizing {len(dataset)} graphs for {dataset_name} (Resolution: {resolution}x{resolution}, Layout: {layout})...")
+    mode_name = "8-Channel Master Atlas (3 Spectral + 5 Spatial)" if include_spectrogram else "5-Channel Spatial Only"
+    print(f"[*] Pre-rasterizing {len(dataset)} graphs for {dataset_name} (Resolution: {resolution}x{resolution}, Layout: {layout}, Mode: {mode_name})...")
     start_t = time.time()
     maps_list = []
     labels_list = []
 
     for idx, data in enumerate(tqdm(dataset, desc=f"Rasterizing {dataset_name}", unit="graph")):
-        m = graph_to_map(data, resolution=resolution, layout_method=layout, seed=42 + idx)
+        m = graph_to_map(data, resolution=resolution, layout_method=layout, include_spectrogram=include_spectrogram, seed=42 + idx)
         maps_list.append(m)
         y_val = data.y.item() if hasattr(data.y, 'item') else int(data.y)
         labels_list.append(y_val)
 
-    X = torch.stack(maps_list, dim=0)  # Shape: (N, 5, H, W)
+    X = torch.stack(maps_list, dim=0)  # Shape: (N, 8 or 5, H, W)
     Y = torch.tensor(labels_list, dtype=torch.long)  # Shape: (N,)
 
     # Normalize labels to 0..C-1 if needed (e.g. some datasets have -1, 1 or 1, 2)
@@ -142,13 +151,96 @@ def get_or_create_rasterized_maps(dataset, dataset_name: str, resolution: int = 
 # 3. 10-FOLD CROSS VALIDATION EVALUATION HARNESS
 # =============================================================================
 
-def train_and_eval_fold(fold: int, model, train_loader, val_loader, device, epochs: int = 100, lr: float = 1e-3, weight_decay: float = 1e-4):
+def augment_graph_maps(bx: torch.Tensor, max_shift: int = 3, cutout_prob: float = 0.3, cutout_size: int = 8) -> torch.Tensor:
+    """
+    Applies domain-aware topological graph map augmentations:
+    - If 8 channels: Ch 0-2 are Spectral (Y: Hops, X: 1D Node Manifold), Ch 3-7 are Spatial Cartography.
+      * Horizontal flip applied to ALL channels (reverses 1D manifold / reflects 2D space).
+      * 2D Rotations & vertical flips applied to Spatial Cartography [3:] (preserving diffusion time arrow).
+    - If 5 channels: Full D4 dihedral transformations applied to all channels.
+    """
+    bx = bx.clone()
+    num_ch = bx.shape[1]
+
+    if num_ch == 8:
+        # 1. Horizontal Flip: Valid for BOTH 1D node ordering and 2D spatial layout
+        if random.random() > 0.5:
+            bx = torch.flip(bx, dims=[-1])
+
+        # 2. 2D Rotations & Vertical Flips: Preserves diffusion time in Ch 0-2 while augmenting spatial Ch 3-7
+        k = random.randint(0, 3)
+        if k > 0:
+            bx[:, 3:] = torch.rot90(bx[:, 3:], k=k, dims=[-2, -1])
+        if random.random() > 0.5:
+            bx[:, 3:] = torch.flip(bx[:, 3:], dims=[-2])
+
+        # 3. Spatial Jitter with Zero-Padding on Spatial Channels
+        if max_shift > 0 and random.random() > 0.5:
+            dy = random.randint(-max_shift, max_shift)
+            dx = random.randint(-max_shift, max_shift)
+            if dy != 0 or dx != 0:
+                bx[:, 3:] = torch.roll(bx[:, 3:], shifts=(dy, dx), dims=(-2, -1))
+                if dy > 0:
+                    bx[:, 3:, :dy, :] = 0.0
+                elif dy < 0:
+                    bx[:, 3:, dy:, :] = 0.0
+                if dx > 0:
+                    bx[:, 3:, :, :dx] = 0.0
+                elif dx < 0:
+                    bx[:, 3:, :, dx:] = 0.0
+
+        # 4. Topological Cutout
+        if cutout_prob > 0 and random.random() < cutout_prob:
+            h, w = bx.shape[-2], bx.shape[-1]
+            top = random.randint(0, max(0, h - cutout_size))
+            left = random.randint(0, max(0, w - cutout_size))
+            bx[:, :, top:top + cutout_size, left:left + cutout_size] = 0.0
+
+    else:
+        # Standard purely spatial 5-channel map: Full D4 group
+        k = random.randint(0, 3)
+        if k > 0:
+            bx = torch.rot90(bx, k=k, dims=[-2, -1])
+        if random.random() > 0.5:
+            bx = torch.flip(bx, dims=[-1])
+        if random.random() > 0.5:
+            bx = torch.flip(bx, dims=[-2])
+
+        if max_shift > 0 and random.random() > 0.5:
+            dy = random.randint(-max_shift, max_shift)
+            dx = random.randint(-max_shift, max_shift)
+            if dy != 0 or dx != 0:
+                bx = torch.roll(bx, shifts=(dy, dx), dims=(-2, -1))
+                if dy > 0:
+                    bx[:, :, :dy, :] = 0.0
+                elif dy < 0:
+                    bx[:, :, dy:, :] = 0.0
+                if dx > 0:
+                    bx[:, :, :, :dx] = 0.0
+                elif dx < 0:
+                    bx[:, :, :, dx:] = 0.0
+
+        if cutout_prob > 0 and random.random() < cutout_prob:
+            h, w = bx.shape[-2], bx.shape[-1]
+            top = random.randint(0, max(0, h - cutout_size))
+            left = random.randint(0, max(0, w - cutout_size))
+            bx[:, :, top:top + cutout_size, left:left + cutout_size] = 0.0
+
+    return bx
+
+
+def train_and_eval_fold(fold: int, model, train_loader, val_loader, device, epochs: int = 10, lr: float = 1e-3, weight_decay: float = 1e-4):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     criterion = nn.CrossEntropyLoss()
 
     best_val_acc = 0.0
     best_epoch = 0
+    best_train_acc = 0.0
+    best_train_loss = 0.0
+    best_val_loss = 0.0
+
+    print_step = max(1, epochs // 5)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -158,11 +250,8 @@ def train_and_eval_fold(fold: int, model, train_loader, val_loader, device, epoc
 
         for bx, by in train_loader:
             bx, by = bx.to(device), by.to(device)
-            # Data Augmentation: Random horizontal/vertical flip on 2D maps
-            if random.random() > 0.5:
-                bx = torch.flip(bx, dims=[-1])
-            if random.random() > 0.5:
-                bx = torch.flip(bx, dims=[-2])
+            # Comprehensive 2D Graph Map Data Augmentation
+            bx = augment_graph_maps(bx)
 
             optimizer.zero_grad()
             logits = model(bx)
@@ -180,38 +269,58 @@ def train_and_eval_fold(fold: int, model, train_loader, val_loader, device, epoc
         # Validation
         model.eval()
         val_correct = 0
+        val_loss = 0.0
         total_val = 0
         with torch.no_grad():
             for bx, by in val_loader:
                 bx, by = bx.to(device), by.to(device)
                 logits = model(bx)
+                loss = criterion(logits, by)
+                val_loss += loss.item() * bx.size(0)
                 preds = logits.argmax(dim=1)
                 val_correct += (preds == by).sum().item()
                 total_val += bx.size(0)
 
-        val_acc = val_correct / total_val if total_val > 0 else 0.0
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_epoch = epoch
+        ep_train_acc = train_correct / total_train if total_train > 0 else 0.0
+        ep_train_loss = train_loss / total_train if total_train > 0 else 0.0
+        ep_val_acc = val_correct / total_val if total_val > 0 else 0.0
+        ep_val_loss = val_loss / total_val if total_val > 0 else 0.0
 
-    return best_val_acc, best_epoch
+        if ep_val_acc > best_val_acc:
+            best_val_acc = ep_val_acc
+            best_epoch = epoch
+            best_train_acc = ep_train_acc
+            best_train_loss = ep_train_loss
+            best_val_loss = ep_val_loss
+
+        # Periodic live training progress print
+        if epoch % print_step == 0 or epoch == epochs or epoch == 1:
+            print(f"    [Ep {epoch:03d}/{epochs:03d}] Train Loss: {ep_train_loss:.4f}, Train Acc: {ep_train_acc * 100:6.2f}% | Val Loss: {ep_val_loss:.4f}, Val Acc: {ep_val_acc * 100:6.2f}% (Best Val: {best_val_acc * 100:.2f}% @ Ep {best_epoch:02d})")
+
+    return best_val_acc, best_epoch, best_train_acc, ep_train_acc, ep_train_loss
 
 
 def main():
     parser = argparse.ArgumentParser(description="Graph2Map Whole-Graph Classification Benchmark")
     parser.add_argument("-d", "--dataset", type=str, default="MUTAG",
                         choices=['MUTAG', 'PROTEINS', 'PTC_MR', 'NCI1', 'IMDB-BINARY', 'IMDB-MULTI', 'BZR', 'COLLAB'])
-    parser.add_argument("-e", "--epoch", type=int, default=100, help="epochs per fold (default: 100)")
+    parser.add_argument("-e", "--epoch", type=int, default=10, help="epochs per fold (default: 10)")
     parser.add_argument("-b", "--batch", type=int, default=32, help="batch size (default: 32)")
     parser.add_argument("-s", "--seed", type=int, default=123, help="random seed (default: 123)")
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate (default: 1e-3)")
     parser.add_argument("--wd", type=float, default=1e-4, help="weight decay (default: 1e-4)")
     parser.add_argument("--res", type=int, default=64, help="canvas resolution (default: 64)")
     parser.add_argument("--layout", type=str, default="spring", choices=["spring", "spectral", "kamada_kawai"])
+    parser.add_argument("-c", "--channels", type=int, default=8, choices=[5, 8],
+                        help="channels: 8 (3 spectral + 5 spatial atlas) or 5 (spatial only) (default: 8)")
+    parser.add_argument("--spatial_only", action="store_true", help="use 5-channel spatial cartography only")
     args = parser.parse_args()
 
+    include_spec = (args.channels == 8) and (not args.spatial_only)
+    mode_str = "8-Channel Master Atlas (3 Spectral + 5 Spatial)" if include_spec else "5-Channel Spatial Only"
+
     print("=" * 80)
-    print(f"Graph2Map 10-Fold Benchmark: {args.dataset}")
+    print(f"Graph2Map 10-Fold Benchmark: {args.dataset} [{mode_str}]")
     print(f"Resolution: {args.res}x{args.res} | Layout: {args.layout} | Epochs: {args.epoch} | Batch: {args.batch} | Seed: {args.seed}")
     print("=" * 80)
 
@@ -228,16 +337,20 @@ def main():
     # Load PyG dataset using the official GRDL benchmark loader
     dataset = load_dataset(args.dataset, args.seed)
     # Rasterize or load cached maps
-    X, Y = get_or_create_rasterized_maps(dataset, args.dataset, resolution=args.res, layout=args.layout)
+    X, Y = get_or_create_rasterized_maps(dataset, args.dataset, resolution=args.res, layout=args.layout, include_spectrogram=include_spec)
     num_classes = len(torch.unique(Y))
     num_samples = len(Y)
+    in_channels = X.shape[1]
 
     # 10-Fold Cross Validation Setup matching GRDL
     kfold = KFold(n_splits=10, shuffle=True, random_state=args.seed)
-    fold_accuracies = []
+    fold_val_accs = []
+    fold_train_accs = []
+    fold_final_train_accs = []
+    fold_final_train_losses = []
 
     print("\n" + "-" * 80)
-    print(f"Starting 10-Fold Cross-Validation on {args.dataset} ({num_samples} total graphs)...")
+    print(f"Starting 10-Fold Cross-Validation on {args.dataset} ({num_samples} total graphs, {in_channels} channels)...")
     print("-" * 80)
 
     total_start_time = time.time()
@@ -252,10 +365,10 @@ def main():
         val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False)
 
         # Fresh model for each fold
-        model = Graph2MapResNet(in_channels=5, num_classes=num_classes).to(device)
+        model = Graph2MapResNet(in_channels=in_channels, num_classes=num_classes).to(device)
 
         fold_start = time.time()
-        best_acc, best_ep = train_and_eval_fold(
+        best_acc, best_ep, best_train_acc, final_train_acc, final_train_loss = train_and_eval_fold(
             fold=fold_num,
             model=model,
             train_loader=train_loader,
@@ -266,21 +379,52 @@ def main():
             weight_decay=args.wd
         )
         fold_time = time.time() - fold_start
-        fold_accuracies.append(best_acc)
+        fold_val_accs.append(best_acc)
+        fold_train_accs.append(best_train_acc)
+        fold_final_train_accs.append(final_train_acc)
+        fold_final_train_losses.append(final_train_loss)
 
-        print(f"  Fold [{fold_num:02d}/10] -> Best Valid Acc: {best_acc * 100:.2f}% (Epoch {best_ep}) | Time: {fold_time:.1f}s")
+        print(f"  Fold [{fold_num:02d}/10] -> Best Valid Acc: {best_acc * 100:6.2f}% (Epoch {best_ep:02d}) | Train Acc @ Best: {best_train_acc * 100:6.2f}% | Final Train Acc: {final_train_acc * 100:6.2f}% (Loss: {final_train_loss:.4f}) | Time: {fold_time:.1f}s")
 
-    fold_accs = np.array(fold_accuracies) * 100.0
-    mean_acc = fold_accs.mean()
-    std_acc = fold_accs.std()
+    fold_val_arr = np.array(fold_val_accs) * 100.0
+    fold_train_arr = np.array(fold_train_accs) * 100.0
+    fold_final_train_arr = np.array(fold_final_train_accs) * 100.0
+
+    mean_val = fold_val_arr.mean()
+    std_val = fold_val_arr.std()
+    mean_train = fold_train_arr.mean()
+    std_train = fold_train_arr.std()
+    mean_final_train = fold_final_train_arr.mean()
+    std_final_train = fold_final_train_arr.std()
+    gap = mean_final_train - mean_val
     total_time = time.time() - total_start_time
 
     print("=" * 80)
     print(f"GRAPH2MAP FINAL RESULTS ON {args.dataset} (10-Fold CV):")
-    print(f"  Mean Accuracy: {mean_acc:.2f}% ± {std_acc:.2f}%")
-    print(f"  All Folds:     {[round(a, 2) for a in fold_accs]}")
-    print(f"  Total Runtime: {total_time:.1f}s")
+    print(f"  Validation Accuracy:   {mean_val:.2f}% ± {std_val:.2f}%")
+    print(f"  Train Acc @ Best Ep:   {mean_train:.2f}% ± {std_train:.2f}%")
+    print(f"  Final Train Accuracy:  {mean_final_train:.2f}% ± {std_final_train:.2f}%")
+    print(f"  Generalization Gap:    {gap:.2f}% (Final Train - Valid)")
+    print(f"  All Valid Folds:       {[round(a, 2) for a in fold_val_arr]}")
+    print(f"  Total Runtime:         {total_time:.1f}s")
     print("=" * 80)
+
+    # Diagnostic analysis on whether model capacity is the bottleneck
+    print("\n--- MODEL BOTTLENECK DIAGNOSTIC ---")
+    if mean_final_train >= 98.0:
+        print(f"  [+] Final Train Accuracy is near-perfect ({mean_final_train:.2f}%).")
+        print(f"  [+] VERDICT: Model capacity is NOT the bottleneck! The backbone easily fits the graph maps.")
+        print(f"  [+] The gap ({gap:.2f}%) is a generalization/regularization gap (e.g. dropout, weight decay, data aug).")
+    elif mean_final_train < 85.0:
+        print(f"  [-] Final Train Accuracy is low ({mean_final_train:.2f}%).")
+        print(f"  [-] VERDICT: Model capacity / representation IS the bottleneck! The backbone is underfitting.")
+        print(f"  [-] Recommended: Increase CNN depth/channels, enlarge resolution (128x128), or adjust learning rate.")
+    else:
+        print(f"  [*] Balanced fit ({mean_final_train:.2f}% train acc, {mean_val:.2f}% val acc).")
+    print("-----------------------------------\n")
+
+    mean_acc = mean_val
+    std_acc = std_val
 
     # Comparison Table from NeurIPS 2024 Table 1
     published_baselines = {
@@ -364,7 +508,7 @@ def main():
 
     results_txt = os.path.join(results_dir, "results_log.txt")
     with open(results_txt, "a", encoding="utf-8") as f:
-        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {args.dataset}: {mean_acc:.2f}% ± {std_acc:.2f}% (Time: {total_time:.1f}s, Folds: {[round(a, 2) for a in fold_accs]})\n")
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {args.dataset} ({in_channels}ch): {mean_acc:.2f}% ± {std_acc:.2f}% (Time: {total_time:.1f}s, Folds: {[round(float(a), 2) for a in fold_val_arr]})\n")
     print(f"[+] Saved results to {results_csv} and {results_txt}")
 
 

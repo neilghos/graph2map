@@ -6,10 +6,12 @@ Runs entirely on PyTorch, NumPy, NetworkX, and PIL without external GUI dependen
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import networkx as nx
 from PIL import Image
 from typing import Tuple, Optional, Union
 from torch_geometric.data import Data
+from torch_geometric.utils import add_self_loops
 
 
 def get_2d_layout(
@@ -131,6 +133,121 @@ def compute_feature_gradients(
     return diff.astype(np.float32)
 
 
+def get_canonical_node_order(num_nodes: int, edge_index: torch.Tensor) -> torch.Tensor:
+    """
+    Computes a canonical 1D ordering of graph nodes along the principal manifold.
+    Uses the Fiedler vector (2nd eigenvector of the graph Laplacian), which provides
+    the optimal 1D continuous embedding minimizing edge stretch.
+    Falls back gracefully to degree/centrality ordering for disconnected or degenerate graphs.
+    """
+    if num_nodes <= 2:
+        return torch.arange(num_nodes)
+
+    try:
+        adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+        adj[edge_index[0], edge_index[1]] = 1.0
+        deg = adj.sum(dim=1)
+        L = torch.diag(deg) - adj
+        evals, evecs = torch.linalg.eigh(L)
+        fiedler = evecs[:, 1]
+        return torch.argsort(fiedler)
+    except Exception:
+        deg = torch.bincount(edge_index[0], minlength=num_nodes).float()
+        return torch.argsort(-deg)
+
+
+def compute_graph_level_spectrogram(
+    data: Data,
+    num_hops: int = 16,
+    resolution: int = 64,
+    ppr_alpha: float = 0.20,
+    gamma_spec: float = 20.0
+) -> torch.Tensor:
+    """
+    Computes the 3-Channel Graph-Level Spectrogram Map:
+      - Ch 0: Spectral Low-Pass Community Consensus (A^k * X)
+      - Ch 1: Spectral High-Pass Boundary Wavelet Gradient (Delta A^k * X)
+      - Ch 2: Structural PageRank / Echo Resonance (PPR dynamics)
+
+    Uses canonical Fiedler 1D node ordering on the horizontal axis and multi-hop
+    diffusion scale on the vertical axis, with Log-Mel dynamic range compression.
+    """
+    num_nodes = data.num_nodes
+    edge_index = data.edge_index
+
+    if num_nodes == 0:
+        return torch.zeros((3, resolution, resolution), dtype=torch.float32)
+
+    # Signal setup
+    if data.x is not None and data.x.numel() > 0:
+        x = data.x.float()
+    else:
+        deg = torch.bincount(edge_index[0], minlength=num_nodes).float().unsqueeze(1)
+        x = torch.log1p(deg)
+
+    # Symmetric normalized adjacency: D^{-1/2} (A + I) D^{-1/2}
+    edge_index_loop, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+    row, col = edge_index_loop[0], edge_index_loop[1]
+    deg = torch.bincount(row, minlength=num_nodes).float()
+    deg_inv_sqrt = torch.pow(deg, -0.5)
+    deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
+    val = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+    adj_norm = torch.sparse_coo_tensor(edge_index_loop, val, (num_nodes, num_nodes)).coalesce()
+
+    # Canonical 1D node ordering via Fiedler eigenvector
+    order = get_canonical_node_order(num_nodes, edge_index)
+
+    s0_hops, s1_hops, s2_hops = [], [], []
+    x_k = x
+    p_k = x
+
+    s0_hops.append(x)
+    s1_hops.append(torch.zeros_like(x))
+    s2_hops.append(x)
+
+    for k in range(1, num_hops):
+        x_next = torch.sparse.mm(adj_norm, x_k)
+        s0_hops.append(x_next)
+        s1_hops.append(x_k - x_next)
+        x_k = x_next
+
+        p_next = ppr_alpha * x + (1.0 - ppr_alpha) * torch.sparse.mm(adj_norm, p_k)
+        s2_hops.append(p_next)
+        p_k = p_next
+
+    # Energy aggregation per node at each hop
+    def to_energy_map(hops_list):
+        stacked = torch.stack(hops_list, dim=0)  # (K, N, D)
+        if stacked.shape[-1] > 1:
+            energy = torch.norm(stacked, p=2, dim=-1)  # (K, N)
+        else:
+            energy = stacked.squeeze(-1)  # (K, N)
+        # Apply canonical node ordering along horizontal axis
+        energy = energy[:, order]
+        return energy
+
+    c0 = to_energy_map(s0_hops)
+    c1 = to_energy_map(s1_hops)
+    c2 = to_energy_map(s2_hops)
+
+    # 2D continuous bilinear interpolation to (resolution, resolution) + Log-Mel compression
+    log_denom = float(np.log(1.0 + gamma_spec))
+
+    def resize_and_compress(mat):
+        m_4d = mat.unsqueeze(0).unsqueeze(0)  # (1, 1, K, N)
+        resized = F.interpolate(m_4d, size=(resolution, resolution), mode='bilinear', align_corners=False).squeeze()
+        m_min = resized.min()
+        m_scaled = (resized - m_min) / (resized.max() - m_min + 1e-6)
+        m_norm = torch.log1p(gamma_spec * m_scaled) / log_denom
+        return m_norm
+
+    spec0 = resize_and_compress(c0)
+    spec1 = resize_and_compress(c1)
+    spec2 = resize_and_compress(c2)
+
+    return torch.stack([spec0, spec1, spec2], dim=0)
+
+
 def graph_to_map(
     data: Data,
     resolution: int = 64,
@@ -138,17 +255,25 @@ def graph_to_map(
     sigma_edge: float = 0.04,
     layout_method: str = "spring",
     include_feature_grad: bool = True,
+    include_spectrogram: bool = True,
     seed: int = 42
 ) -> torch.Tensor:
     """
     Rasterize a PyG Data graph into a continuous multi-channel 2D heatmap tensor (C, H, W).
     
-    Channels:
-      - Ch 0: Node Density Field (Gaussian KDE splatting)
-      - Ch 1: Edge Flux / Line Density Field (Continuous line segment splatting)
-      - Ch 2: Multi-Hop "Echo" Basin (Random walk return probability splatting)
-      - Ch 3: Feature Boundary Field (Edge disparity splatting)
-      - Ch 4: Node Feature / Semantic Splatting (Node attribute magnitude / projection)
+    When include_spectrogram=True (8 Channels Total):
+      - Channels 0-2 (Spectral Dynamics):
+          * Ch 0: Spectral Low-Pass Community Consensus (A^k * X)
+          * Ch 1: Spectral High-Pass Boundary Wavelet Gradient (Delta A^k * X)
+          * Ch 2: Structural PageRank Resonance (PPR echo)
+      - Channels 3-7 (Spatial Cartography):
+          * Ch 3: Node Density Field (Gaussian KDE splatting)
+          * Ch 4: Edge Flux / Line Density Field (Continuous line segment splatting)
+          * Ch 5: Multi-Hop "Echo" Basin (Random walk return probability splatting)
+          * Ch 6: Feature Boundary Field (Edge disparity splatting)
+          * Ch 7: Node Semantic Splatting (Node attribute magnitude / projection)
+
+    When include_spectrogram=False (5 Channels Spatial Cartography).
     """
     num_nodes = data.num_nodes
     edge_index = data.edge_index
@@ -221,7 +346,7 @@ def graph_to_map(
     else:
         node_feat_field = np.zeros((resolution, resolution), dtype=np.float32)
 
-    # Normalize each channel to [0, 1]
+    # Normalize spatial channels to [0, 1]
     channels = [node_field, edge_field, echo_field, feat_field, node_feat_field]
     normalized_channels = []
     for ch in channels:
@@ -233,5 +358,11 @@ def graph_to_map(
             ch_norm = ch
         normalized_channels.append(ch_norm.astype(np.float32))
 
-    tensor = torch.from_numpy(np.stack(normalized_channels, axis=0))
-    return tensor
+    spatial_tensor = torch.from_numpy(np.stack(normalized_channels, axis=0))
+
+    if include_spectrogram:
+        spectrogram_3ch = compute_graph_level_spectrogram(data, num_hops=16, resolution=resolution)
+        master_atlas = torch.cat([spectrogram_3ch, spatial_tensor], dim=0)  # Shape: (8, H, W)
+        return master_atlas
+
+    return spatial_tensor

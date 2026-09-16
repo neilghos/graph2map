@@ -13,49 +13,49 @@ PYTHON_EXE = sys.executable
 
 BENCHMARK_TARGETS = {
     'MUTAG': {
-        'epochs': 100,
+        'epochs': 10,
         'batch': 32,
         'lr': 1e-3,
         'sota': '92.6% ± 4.2% (PATCHY-SAN) / 92.6% ± 4.3% (SAT) / 92.1% ± 5.9% (GRDL NeurIPS 2024)'
     },
     'PROTEINS': {
-        'epochs': 100,
+        'epochs': 10,
         'batch': 32,
         'lr': 1e-3,
         'sota': '82.6% ± 1.2% (GRDL NeurIPS 2024) / 80.0% ± 3.2% (WiTTopoPool) / 77.7% (SAT)'
     },
     'NCI1': {
-        'epochs': 100,
+        'epochs': 10,
         'batch': 64,
         'lr': 1e-3,
         'sota': '85.7% ± 0.8% (WWL) / 82.9% ± 2.1% (OT-GNN) / 82.5% (SAT) / 80.4% (GRDL)'
     },
     'IMDB-BINARY': {
-        'epochs': 100,
+        'epochs': 10,
         'batch': 32,
         'lr': 1e-3,
         'sota': '74.8% ± 2.0% (GRDL NeurIPS 2024) / 74.1% ± 0.6% (SEP) / 70.3% (Graphormer)'
     },
     'IMDB-MULTI': {
-        'epochs': 100,
+        'epochs': 10,
         'batch': 32,
         'lr': 1e-3,
         'sota': '53.1% ± 0.9% (GRDL-W) / 52.9% ± 1.8% (GRDL) / 52.6% (WWL)'
     },
     'PTC_MR': {
-        'epochs': 100,
+        'epochs': 10,
         'batch': 32,
         'lr': 1e-3,
         'sota': '71.4% ± 5.2% (Graphormer) / 70.2% ± 6.2% (GMT) / 68.3% (GRDL)'
     },
     'BZR': {
-        'epochs': 100,
+        'epochs': 10,
         'batch': 32,
         'lr': 1e-3,
         'sota': '92.0% ± 1.1% (GRDL NeurIPS 2024) / 91.7% ± 2.1% (SAT) / 87.6% (WWL)'
     },
     'COLLAB': {
-        'epochs': 80,
+        'epochs': 10,
         'batch': 64,
         'lr': 1e-3,
         'sota': '81.4% ± 2.1% (WWL) / 81.3% ± 0.2% (SEP) / 80.6% (SAT) / 79.8% (GRDL)'
@@ -63,8 +63,8 @@ BENCHMARK_TARGETS = {
 }
 
 
-def run_dataset(dataset_name: str, epochs: int = None, batch: int = None, lr: float = None, layout: str = "spring"):
-    cfg = BENCHMARK_TARGETS.get(dataset_name, {'epochs': 100, 'batch': 32, 'lr': 1e-3, 'sota': 'N/A'})
+def run_dataset(dataset_name: str, epochs: int = None, batch: int = None, lr: float = None, layout: str = "spring", channels: int = None):
+    cfg = BENCHMARK_TARGETS.get(dataset_name, {'epochs': 10, 'batch': 32, 'lr': 1e-3, 'sota': 'N/A'})
     ep = epochs if epochs is not None else cfg['epochs']
     bs = batch if batch is not None else cfg['batch']
     learning_rate = lr if lr is not None else cfg['lr']
@@ -77,6 +77,8 @@ def run_dataset(dataset_name: str, epochs: int = None, batch: int = None, lr: fl
         "--lr", str(learning_rate),
         "--layout", layout
     ]
+    if channels is not None:
+        cmd.extend(["-c", str(channels)])
 
     print("\n" + "=" * 80)
     print(f"[*] LAUNCHING: {' '.join(cmd)}")
@@ -99,6 +101,7 @@ def main():
     parser.add_argument("--remaining", action="store_true", help="run the un-benchmarked datasets: BZR, PTC_MR, IMDB-MULTI, COLLAB")
     parser.add_argument("-e", "--epoch", type=int, default=None, help="override epochs")
     parser.add_argument("-b", "--batch", type=int, default=None, help="override batch size")
+    parser.add_argument("-c", "--channels", type=int, default=None, choices=[5, 8], help="override channels (5 or 8)")
     parser.add_argument("--layout", type=str, default="spring", choices=["spring", "spectral", "kamada_kawai"])
     args = parser.parse_args()
 
@@ -106,18 +109,18 @@ def main():
     REMAINING_SUITE = ['BZR', 'PTC_MR', 'IMDB-MULTI', 'COLLAB']
 
     if args.dataset:
-        run_dataset(args.dataset, epochs=args.epoch, batch=args.batch, layout=args.layout)
+        run_dataset(args.dataset, epochs=args.epoch, batch=args.batch, layout=args.layout, channels=args.channels)
     elif args.remaining:
         print(f"[*] Running remaining benchmarks: {REMAINING_SUITE}")
         for ds in REMAINING_SUITE:
-            rc = run_dataset(ds, epochs=args.epoch, batch=args.batch, layout=args.layout)
+            rc = run_dataset(ds, epochs=args.epoch, batch=args.batch, layout=args.layout, channels=args.channels)
             if rc != 0:
                 print(f"[!] Error occurred on {ds}, stopping suite.")
                 break
     elif args.all:
         print(f"[*] Running full Table 1 suite: {ALL_SUITE}")
         for ds in ALL_SUITE:
-            rc = run_dataset(ds, epochs=args.epoch, batch=args.batch, layout=args.layout)
+            rc = run_dataset(ds, epochs=args.epoch, batch=args.batch, layout=args.layout, channels=args.channels)
             if rc != 0:
                 print(f"[!] Error occurred on {ds}, stopping suite.")
                 break
@@ -125,7 +128,7 @@ def main():
         # Default quick duo
         print(f"[*] Running quick duo: ['MUTAG', 'PROTEINS']")
         for ds in ['MUTAG', 'PROTEINS']:
-            run_dataset(ds, epochs=args.epoch, batch=args.batch, layout=args.layout)
+            run_dataset(ds, epochs=args.epoch, batch=args.batch, layout=args.layout, channels=args.channels)
 
 
 if __name__ == "__main__":

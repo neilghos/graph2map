@@ -33,7 +33,7 @@ PUBLISHED_SOTA = {
 DEFAULT_SEEDS = [123, 456, 789, 42, 2024, 1007, 2025, 999, 1337, 777]
 
 
-def run_benchmark_for_dataset(dataset_name: str, seeds: list, epochs: int = 100, batch_size: int = 32, lr: float = 1e-3, layout: str = "spring", resolution: int = 64):
+def run_benchmark_for_dataset(dataset_name: str, seeds: list, epochs: int = 10, batch_size: int = 32, lr: float = 1e-3, layout: str = "spring", resolution: int = 64):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 80)
     print(f"[*] BENCHMARKING: {dataset_name} across {len(seeds)} seeds (Seeds: {seeds})")
@@ -72,7 +72,7 @@ def run_benchmark_for_dataset(dataset_name: str, seeds: list, epochs: int = 100,
             val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
             model = Graph2MapResNet(in_channels=5, num_classes=num_classes).to(device)
-            best_acc, best_ep = train_and_eval_fold(
+            best_acc, best_ep, best_train_acc, final_train_acc, final_train_loss = train_and_eval_fold(
                 fold=fold_num,
                 model=model,
                 train_loader=train_loader,
@@ -134,7 +134,7 @@ def main():
                         choices=['MUTAG', 'PROTEINS', 'PTC_MR', 'NCI1', 'IMDB-BINARY', 'IMDB-MULTI', 'BZR', 'COLLAB', 'all'])
     parser.add_argument("-n", "--num_seeds", type=int, default=5,
                         help="number of random seeds to evaluate (default: 5)")
-    parser.add_argument("-e", "--epoch", type=int, default=100, help="epochs per fold (default: 100)")
+    parser.add_argument("-e", "--epoch", type=int, default=10, help="epochs per fold (default: 10)")
     parser.add_argument("-b", "--batch", type=int, default=32, help="batch size (default: 32)")
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate (default: 1e-3)")
     parser.add_argument("--res", type=int, default=64, help="canvas resolution (default: 64)")
