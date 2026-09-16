@@ -227,10 +227,9 @@ def main():
 
     # Load PyG dataset using the official GRDL benchmark loader
     dataset = load_dataset(args.dataset, args.seed)
-    num_classes = dataset.num_classes
-
     # Rasterize or load cached maps
     X, Y = get_or_create_rasterized_maps(dataset, args.dataset, resolution=args.res, layout=args.layout)
+    num_classes = len(torch.unique(Y))
     num_samples = len(Y)
 
     # 10-Fold Cross Validation Setup matching GRDL
@@ -283,12 +282,67 @@ def main():
     print(f"  Total Runtime: {total_time:.1f}s")
     print("=" * 80)
 
-    # Comparison Table
+    # Comparison Table from NeurIPS 2024 Table 1
     published_baselines = {
-        'MUTAG': {'GIN': '89.4% ± 5.6%', 'GRDL (NeurIPS 2024)': '92.1% ± 5.9%', 'DiffLifting (ICLR 2025)': '92.6% ± 4.5%'},
-        'PROTEINS': {'GIN': '76.2% ± 2.8%', 'GRDL (NeurIPS 2024)': '76.8% ± 3.2%', 'Injective GNN (ICLR 2025)': '77.5% ± 2.4%'},
-        'NCI1': {'GIN': '82.7% ± 1.7%', 'GRDL (NeurIPS 2024)': '82.9% ± 1.5%', 'DiffLifting (ICLR 2025)': '83.8% ± 1.3%'},
-        'IMDB-BINARY': {'GIN': '75.1% ± 2.4%', 'GRDL (NeurIPS 2024)': '75.8% ± 2.8%', 'DiffLifting (ICLR 2025)': '76.2% ± 3.0%'}
+        'MUTAG': {
+            'GIN': '89.4% ± 5.6%',
+            'Graphormer': '89.6% ± 6.2%',
+            'PATCHY-SAN': '92.6% ± 4.2%',
+            'SAT': '92.6% ± 4.3%',
+            'GRDL (NeurIPS 2024)': '92.1% ± 5.9%'
+        },
+        'PROTEINS': {
+            'GIN': '76.2% ± 2.8%',
+            'Graphormer': '76.3% ± 2.7%',
+            'SAT': '77.7% ± 3.2%',
+            'WiTTopoPool': '80.0% ± 3.2%',
+            'GRDL (NeurIPS 2024)': '82.6% ± 1.2%'
+        },
+        'NCI1': {
+            'GRDL (NeurIPS 2024)': '80.4% ± 0.8%',
+            'GIN': '82.2% ± 0.8%',
+            'SAT': '82.5% ± 0.8%',
+            'OT-GNN': '82.9% ± 2.1%',
+            'WWL': '85.7% ± 0.8%'
+        },
+        'IMDB-BINARY': {
+            'GIN': '64.3% ± 3.1%',
+            'Graphormer': '70.3% ± 0.9%',
+            'WWL': '71.6% ± 3.8%',
+            'SEP': '74.1% ± 0.6%',
+            'GRDL (NeurIPS 2024)': '74.8% ± 2.0%'
+        },
+        'IMDB-MULTI': {
+            'Graphormer': '48.9% ± 2.0%',
+            'GIN': '50.9% ± 1.7%',
+            'WWL': '52.6% ± 3.0%',
+            'WiTTopoPool': '52.9% ± 0.8%',
+            'GRDL (NeurIPS 2024)': '52.9% ± 1.8%',
+            'GRDL-W': '53.1% ± 0.9%'
+        },
+        'PTC_MR': {
+            'GIN': '64.6% ± 7.0%',
+            'OT-GNN': '68.0% ± 7.5%',
+            'GRDL (NeurIPS 2024)': '68.3% ± 5.4%',
+            'GMT': '70.2% ± 6.2%',
+            'Graphormer': '71.4% ± 5.2%'
+        },
+        'BZR': {
+            'GIN': '82.6% ± 3.5%',
+            'Graphormer': '85.3% ± 2.3%',
+            'WWL': '87.6% ± 0.6%',
+            'SAT': '91.7% ± 2.1%',
+            'GRDL (NeurIPS 2024)': '92.0% ± 1.1%'
+        },
+        'COLLAB': {
+            'GIN': '79.3% ± 1.7%',
+            'GRDL (NeurIPS 2024)': '79.8% ± 0.9%',
+            'Graphormer': '80.3% ± 1.3%',
+            'SAT': '80.6% ± 0.6%',
+            'MinCutPool': '80.9% ± 0.3%',
+            'SEP': '81.3% ± 0.2%',
+            'WWL': '81.4% ± 2.1%'
+        }
     }
 
     if args.dataset in published_baselines:
@@ -297,6 +351,21 @@ def main():
             print(f"  • {paper:30s}: {score}")
         print(f"  • {'Graph2Map (Ours)':30s}: {mean_acc:.2f}% ± {std_acc:.2f}%")
         print("=" * 80)
+
+    # Automatically save results to persistent CSV & TXT log
+    results_dir = "./results"
+    os.makedirs(results_dir, exist_ok=True)
+    results_csv = os.path.join(results_dir, "benchmark_results.csv")
+    write_header = not os.path.exists(results_csv)
+    with open(results_csv, "a", encoding="utf-8") as f:
+        if write_header:
+            f.write("dataset,mean_acc,std_acc,resolution,layout,epochs,batch_size,lr,time_sec\n")
+        f.write(f"{args.dataset},{mean_acc:.2f},{std_acc:.2f},{args.res},{args.layout},{args.epoch},{args.batch},{args.lr},{total_time:.1f}\n")
+
+    results_txt = os.path.join(results_dir, "results_log.txt")
+    with open(results_txt, "a", encoding="utf-8") as f:
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {args.dataset}: {mean_acc:.2f}% ± {std_acc:.2f}% (Time: {total_time:.1f}s, Folds: {[round(a, 2) for a in fold_accs]})\n")
+    print(f"[+] Saved results to {results_csv} and {results_txt}")
 
 
 if __name__ == "__main__":
