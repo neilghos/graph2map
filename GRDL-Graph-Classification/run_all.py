@@ -63,7 +63,7 @@ BENCHMARK_TARGETS = {
 }
 
 
-def run_dataset(dataset_name: str, epochs: int = None, batch: int = None, lr: float = None, layout: str = "spring", channels: int = None):
+def run_dataset(dataset_name: str, epochs: int = None, batch: int = None, lr: float = None, layout: str = "spring", channels: int = None, social_features: str = None):
     cfg = BENCHMARK_TARGETS.get(dataset_name, {'epochs': 10, 'batch': 32, 'lr': 1e-3, 'sota': 'N/A'})
     ep = epochs if epochs is not None else cfg['epochs']
     bs = batch if batch is not None else cfg['batch']
@@ -79,6 +79,8 @@ def run_dataset(dataset_name: str, epochs: int = None, batch: int = None, lr: fl
     ]
     if channels is not None:
         cmd.extend(["-c", str(channels)])
+    if social_features is not None:
+        cmd.extend(["--social_features", str(social_features)])
 
     print("\n" + "=" * 80)
     print(f"[*] LAUNCHING: {' '.join(cmd)}")
@@ -103,6 +105,9 @@ def main():
     parser.add_argument("-e", "--epoch", type=int, default=None, help="override epochs (e.g. 200)")
     parser.add_argument("-b", "--batch", type=int, default=None, help="override batch size")
     parser.add_argument("-c", "--channels", type=int, default=7, choices=[2, 5, 7, 8], help="override channels (default: 7 for Feature-Manifold Atlas)")
+    parser.add_argument("--social_features", type=str, default="lightgcn",
+                        choices=['lightgcn', 'degree', 'lappe', 'heat', 'svd', 'unified'],
+                        help="structural latent method for social graphs (default: lightgcn)")
     parser.add_argument("--layout", type=str, default="spring", choices=["spring", "spectral", "kamada_kawai"])
     args = parser.parse_args()
 
@@ -111,7 +116,7 @@ def main():
     REMAINING_SUITE = ['BZR', 'PTC_MR', 'IMDB-MULTI', 'COLLAB']
 
     if args.dataset:
-        run_dataset(args.dataset, epochs=args.epoch, batch=args.batch, layout=args.layout, channels=args.channels)
+        run_dataset(args.dataset, epochs=args.epoch, batch=args.batch, layout=args.layout, channels=args.channels, social_features=args.social_features)
     elif args.featured:
         print(f"[*] Running all 5 featured benchmarks: {FEATURED_SUITE} (Channels: {args.channels})")
         for ds in FEATURED_SUITE:

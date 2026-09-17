@@ -16,7 +16,7 @@ from sklearn.model_selection import KFold
 from tqdm import tqdm
 
 from exp_util import load_dataset
-from graph_level_rasterizer import graph_to_map
+from graph_level_rasterizer import graph_to_map, attach_social_features
 
 
 # =============================================================================
@@ -110,16 +110,25 @@ def get_or_create_rasterized_maps(
     resolution: int = 64,
     layout: str = "spring",
     channel_mode: str = "7ch",
+    social_features: str = "lightgcn",
     cache_dir: str = "./cache"
 ):
     os.makedirs(cache_dir, exist_ok=True)
     ch_tag = channel_mode
-    cache_path = os.path.join(cache_dir, f"{dataset_name}_res{resolution}_{layout}_{ch_tag}.pt")
+    is_social = dataset_name in ["IMDB-BINARY", "IMDB-MULTI", "COLLAB"]
+    if is_social:
+        cache_path = os.path.join(cache_dir, f"{dataset_name}_res{resolution}_{layout}_{ch_tag}_{social_features}.pt")
+    else:
+        cache_path = os.path.join(cache_dir, f"{dataset_name}_res{resolution}_{layout}_{ch_tag}.pt")
 
     if os.path.exists(cache_path):
         print(f"[*] Loading pre-rasterized {dataset_name} maps from cache: {cache_path}")
         cache_data = torch.load(cache_path)
         return cache_data['X'], cache_data['Y']
+
+    # Attach structural latent features for unattributed social graphs
+    if is_social:
+        dataset = attach_social_features(dataset, dataset_name, method=social_features, cache_dir=cache_dir)
 
     mode_names = {
         "7ch": "7-Channel Master Atlas (2 Feature-Manifold + 5 Spatial)",
@@ -127,7 +136,8 @@ def get_or_create_rasterized_maps(
         "5ch": "5-Channel Spatial Only",
         "2ch": "2-Channel Feature-Manifold Only"
     }
-    mode_name = mode_names.get(channel_mode, f"{channel_mode} Atlas")
+    feat_tag = f" + {social_features.upper()}" if is_social else ""
+    mode_name = mode_names.get(channel_mode, f"{channel_mode} Atlas") + feat_tag
     print(f"[*] Pre-rasterizing {len(dataset)} graphs for {dataset_name} (Resolution: {resolution}x{resolution}, Layout: {layout}, Mode: {mode_name})...")
     start_t = time.time()
     maps_list = []
@@ -354,6 +364,9 @@ def main():
     parser.add_argument("--layout", type=str, default="spring", choices=["spring", "spectral", "kamada_kawai"])
     parser.add_argument("-c", "--channels", type=int, default=7, choices=[2, 5, 7, 8],
                         help="channels: 7 (2 feature-manifold + 5 spatial atlas), 8 (legacy 3 spectral + 5 spatial), 5 (spatial only), or 2 (feature only) (default: 7)")
+    parser.add_argument("--social_features", type=str, default="lightgcn",
+                        choices=['lightgcn', 'degree', 'lappe', 'heat', 'svd', 'unified'],
+                        help="structural latent method for unattributed social graphs (default: lightgcn)")
     parser.add_argument("--spatial_only", action="store_true", help="use 5-channel spatial cartography only")
     parser.add_argument("--feature_only", action="store_true", help="use 2-channel feature manifold only")
     args = parser.parse_args()
@@ -391,7 +404,14 @@ def main():
     # Load PyG dataset using the official GRDL benchmark loader
     dataset = load_dataset(args.dataset, args.seed)
     # Rasterize or load cached maps
-    X, Y = get_or_create_rasterized_maps(dataset, args.dataset, resolution=args.res, layout=args.layout, channel_mode=channel_mode)
+    X, Y = get_or_create_rasterized_maps(
+        dataset,
+        args.dataset,
+        resolution=args.res,
+        layout=args.layout,
+        channel_mode=channel_mode,
+        social_features=args.social_features
+    )
     num_classes = len(torch.unique(Y))
     num_samples = len(Y)
     in_channels = X.shape[1]
@@ -560,9 +580,10 @@ def main():
             f.write("dataset,mean_acc,std_acc,resolution,layout,epochs,batch_size,lr,time_sec\n")
         f.write(f"{args.dataset},{mean_acc:.2f},{std_acc:.2f},{args.res},{args.layout},{args.epoch},{args.batch},{args.lr},{total_time:.1f}\n")
 
+    social_tag = f", {args.social_features}" if args.dataset in ["IMDB-BINARY", "IMDB-MULTI", "COLLAB"] else ""
     results_txt = os.path.join(results_dir, "results_log.txt")
     with open(results_txt, "a", encoding="utf-8") as f:
-        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {args.dataset} ({in_channels}ch): {mean_acc:.2f}% ± {std_acc:.2f}% (Time: {total_time:.1f}s, Folds: {[round(float(a), 2) for a in fold_val_arr]})\n")
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {args.dataset} ({in_channels}ch{social_tag}): {mean_acc:.2f}% ± {std_acc:.2f}% (Time: {total_time:.1f}s, Folds: {[round(float(a), 2) for a in fold_val_arr]})\n")
     print(f"[+] Saved results to {results_csv} and {results_txt}")
 
 

@@ -4,6 +4,7 @@ Converts graph structures into continuous multi-channel 2D topological heatmaps.
 Runs entirely on PyTorch, NumPy, NetworkX, and PIL without external GUI dependencies.
 """
 
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -441,4 +442,41 @@ def graph_to_map(
         return compute_feature_manifold_map(data, resolution=resolution)  # Shape: (2, H, W)
     else:  # "5ch"
         return spatial_tensor  # Shape: (5, H, W)
+
+
+def attach_social_features(
+    dataset,
+    dataset_name: str,
+    method: str = "lightgcn",
+    embedding_dim: int = 64,
+    cache_dir: str = "./cache"
+):
+    """
+    Attaches continuous 64-dimensional structural latent node features to unattributed social graphs.
+    Supported Methods:
+      - 'lightgcn': Self-supervised link reconstruction embeddings (L2-normalized BCE)
+      - 'degree': Log-degree scalar feature (fallback)
+    """
+    social_datasets = ["IMDB-BINARY", "IMDB-MULTI", "COLLAB"]
+    if dataset_name not in social_datasets:
+        return dataset
+
+    if method == "lightgcn":
+        emb_cache_path = os.path.join(cache_dir, f"lightgcn_{dataset_name}_dim{embedding_dim}_emb.pt")
+        if not os.path.exists(emb_cache_path):
+            print(f"[*] LightGCN embeddings for {dataset_name} not found at {emb_cache_path}. Pretraining now...")
+            from pretrain_lightgcn import pretrain_lightgcn
+            pretrain_lightgcn(dataset_name=dataset_name, epochs=500, embedding_dim=embedding_dim, cache_dir=cache_dir)
+
+        print(f"[*] Attaching precomputed 64-dim LightGCN structural features from: {emb_cache_path}")
+        embeddings_list = torch.load(emb_cache_path, weights_only=False)
+        for idx, data in enumerate(dataset):
+            data.x = embeddings_list[idx].float()
+    elif method == "degree":
+        print(f"[*] Using 1-dim log-degree features for {dataset_name}")
+        for data in dataset:
+            deg = torch.bincount(data.edge_index[0], minlength=data.num_nodes).float().unsqueeze(1)
+            data.x = torch.log1p(deg)
+    return dataset
+
 
