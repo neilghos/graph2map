@@ -248,6 +248,78 @@ def compute_graph_level_spectrogram(
     return torch.stack([spec0, spec1, spec2], dim=0)
 
 
+def compute_feature_manifold_map(
+    data: Data,
+    resolution: int = 64
+) -> torch.Tensor:
+    """
+    Computes 2-Channel Feature-Manifold Map:
+      - Ch 0: Normalized Raw Feature Distribution (Features x Canonical Nodes)
+      - Ch 1: Normalized Graph Laplacian Feature Gradient (Boundary / Transition Curvature)
+
+    X-axis (Horizontal): Canonical Nodes ordered along 1D Fiedler Laplacian manifold
+    Y-axis (Vertical): Feature dimensions (atom types, functional attributes)
+    """
+    num_nodes = data.num_nodes
+    edge_index = data.edge_index
+
+    if num_nodes == 0:
+        return torch.zeros((2, resolution, resolution), dtype=torch.float32)
+
+    # 1. Feature matrix setup
+    if data.x is not None and data.x.numel() > 0:
+        x = data.x.float()
+        if x.dim() == 1:
+            x = x.unsqueeze(1)
+    else:
+        deg = torch.bincount(edge_index[0], minlength=num_nodes).float().unsqueeze(1)
+        x = torch.log1p(deg)
+
+    # 2. Canonical 1D node ordering via Fiedler eigenvector
+    order = get_canonical_node_order(num_nodes, edge_index)
+
+    # 3. Channel 0: Raw feature matrix (Features x Nodes)
+    x_ordered = x[order, :]  # (N, D)
+    raw_mat = x_ordered.t()  # (D, N)
+
+    # 4. Channel 1: Normalized Graph Laplacian Feature Gradient
+    if edge_index.shape[1] > 0 and num_nodes > 1:
+        edge_index_loop, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+        row, col = edge_index_loop[0], edge_index_loop[1]
+        deg = torch.bincount(row, minlength=num_nodes).float()
+        deg_inv_sqrt = torch.pow(deg, -0.5)
+        deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
+        val = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+        adj_norm = torch.sparse_coo_tensor(edge_index_loop, val, (num_nodes, num_nodes)).coalesce()
+
+        x_smooth = torch.sparse.mm(adj_norm, x)
+        laplacian_x = torch.abs(x - x_smooth)
+    else:
+        laplacian_x = torch.zeros_like(x)
+
+    laplacian_ordered = laplacian_x[order, :]
+    lap_mat = laplacian_ordered.t()  # (D, N)
+
+    # 5. Continuous bilinear interpolation to (resolution, resolution)
+    def to_channel_map(mat):
+        mat_4d = mat.unsqueeze(0).unsqueeze(0)  # (1, 1, D, N)
+        resized = F.interpolate(mat_4d, size=(resolution, resolution), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+        m_min = resized.min()
+        m_max = resized.max()
+        if m_max - m_min > 1e-6:
+            normed = (resized - m_min) / (m_max - m_min)
+        elif m_max > 0:
+            normed = torch.ones_like(resized)
+        else:
+            normed = torch.zeros_like(resized)
+        return normed
+
+    ch0 = to_channel_map(raw_mat)
+    ch1 = to_channel_map(lap_mat)
+
+    return torch.stack([ch0, ch1], dim=0)
+
+
 def graph_to_map(
     data: Data,
     resolution: int = 64,
@@ -255,25 +327,18 @@ def graph_to_map(
     sigma_edge: float = 0.04,
     layout_method: str = "spring",
     include_feature_grad: bool = True,
-    include_spectrogram: bool = True,
+    channel_mode: str = "7ch",
+    include_spectrogram: Optional[bool] = None,
     seed: int = 42
 ) -> torch.Tensor:
     """
     Rasterize a PyG Data graph into a continuous multi-channel 2D heatmap tensor (C, H, W).
     
-    When include_spectrogram=True (8 Channels Total):
-      - Channels 0-2 (Spectral Dynamics):
-          * Ch 0: Spectral Low-Pass Community Consensus (A^k * X)
-          * Ch 1: Spectral High-Pass Boundary Wavelet Gradient (Delta A^k * X)
-          * Ch 2: Structural PageRank Resonance (PPR echo)
-      - Channels 3-7 (Spatial Cartography):
-          * Ch 3: Node Density Field (Gaussian KDE splatting)
-          * Ch 4: Edge Flux / Line Density Field (Continuous line segment splatting)
-          * Ch 5: Multi-Hop "Echo" Basin (Random walk return probability splatting)
-          * Ch 6: Feature Boundary Field (Edge disparity splatting)
-          * Ch 7: Node Semantic Splatting (Node attribute magnitude / projection)
-
-    When include_spectrogram=False (5 Channels Spatial Cartography).
+    Modes:
+      - '7ch' (Master Atlas): 2 Feature-Manifold Channels (Raw X + Laplacian LX) + 5 Spatial Cartography Channels
+      - '8ch' (Legacy Atlas): 3 Hop-Diffusion Spectrogram Channels + 5 Spatial Cartography Channels
+      - '5ch' (Spatial Only): 5 Spatial Cartography Channels
+      - '2ch' (Feature Only): 2 Feature-Manifold Channels (Raw X + Laplacian LX)
     """
     num_nodes = data.num_nodes
     edge_index = data.edge_index
@@ -360,9 +425,20 @@ def graph_to_map(
 
     spatial_tensor = torch.from_numpy(np.stack(normalized_channels, axis=0))
 
-    if include_spectrogram:
-        spectrogram_3ch = compute_graph_level_spectrogram(data, num_hops=16, resolution=resolution)
-        master_atlas = torch.cat([spectrogram_3ch, spatial_tensor], dim=0)  # Shape: (8, H, W)
-        return master_atlas
+    if include_spectrogram is not None:
+        if not include_spectrogram:
+            channel_mode = "5ch"
+        elif channel_mode == "5ch":
+            channel_mode = "8ch"
 
-    return spatial_tensor
+    if channel_mode == "7ch":
+        feat_manifold_2ch = compute_feature_manifold_map(data, resolution=resolution)
+        return torch.cat([feat_manifold_2ch, spatial_tensor], dim=0)  # Shape: (7, H, W)
+    elif channel_mode == "8ch":
+        spectrogram_3ch = compute_graph_level_spectrogram(data, num_hops=16, resolution=resolution)
+        return torch.cat([spectrogram_3ch, spatial_tensor], dim=0)  # Shape: (8, H, W)
+    elif channel_mode == "2ch":
+        return compute_feature_manifold_map(data, resolution=resolution)  # Shape: (2, H, W)
+    else:  # "5ch"
+        return spatial_tensor  # Shape: (5, H, W)
+

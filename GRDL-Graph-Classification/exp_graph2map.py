@@ -109,11 +109,11 @@ def get_or_create_rasterized_maps(
     dataset_name: str,
     resolution: int = 64,
     layout: str = "spring",
-    include_spectrogram: bool = True,
+    channel_mode: str = "7ch",
     cache_dir: str = "./cache"
 ):
     os.makedirs(cache_dir, exist_ok=True)
-    ch_tag = "8ch" if include_spectrogram else "5ch"
+    ch_tag = channel_mode
     cache_path = os.path.join(cache_dir, f"{dataset_name}_res{resolution}_{layout}_{ch_tag}.pt")
 
     if os.path.exists(cache_path):
@@ -121,19 +121,25 @@ def get_or_create_rasterized_maps(
         cache_data = torch.load(cache_path)
         return cache_data['X'], cache_data['Y']
 
-    mode_name = "8-Channel Master Atlas (3 Spectral + 5 Spatial)" if include_spectrogram else "5-Channel Spatial Only"
+    mode_names = {
+        "7ch": "7-Channel Master Atlas (2 Feature-Manifold + 5 Spatial)",
+        "8ch": "8-Channel Legacy Atlas (3 Spectral + 5 Spatial)",
+        "5ch": "5-Channel Spatial Only",
+        "2ch": "2-Channel Feature-Manifold Only"
+    }
+    mode_name = mode_names.get(channel_mode, f"{channel_mode} Atlas")
     print(f"[*] Pre-rasterizing {len(dataset)} graphs for {dataset_name} (Resolution: {resolution}x{resolution}, Layout: {layout}, Mode: {mode_name})...")
     start_t = time.time()
     maps_list = []
     labels_list = []
 
     for idx, data in enumerate(tqdm(dataset, desc=f"Rasterizing {dataset_name}", unit="graph")):
-        m = graph_to_map(data, resolution=resolution, layout_method=layout, include_spectrogram=include_spectrogram, seed=42 + idx)
+        m = graph_to_map(data, resolution=resolution, layout_method=layout, channel_mode=channel_mode, seed=42 + idx)
         maps_list.append(m)
         y_val = data.y.item() if hasattr(data.y, 'item') else int(data.y)
         labels_list.append(y_val)
 
-    X = torch.stack(maps_list, dim=0)  # Shape: (N, 8 or 5, H, W)
+    X = torch.stack(maps_list, dim=0)  # Shape: (N, C, H, W)
     Y = torch.tensor(labels_list, dtype=torch.long)  # Shape: (N,)
 
     # Normalize labels to 0..C-1 if needed (e.g. some datasets have -1, 1 or 1, 2)
@@ -154,27 +160,59 @@ def get_or_create_rasterized_maps(
 def augment_graph_maps(bx: torch.Tensor, max_shift: int = 3, cutout_prob: float = 0.3, cutout_size: int = 8) -> torch.Tensor:
     """
     Applies domain-aware topological graph map augmentations:
-    - If 8 channels: Ch 0-2 are Spectral (Y: Hops, X: 1D Node Manifold), Ch 3-7 are Spatial Cartography.
+    - If 7 channels: Ch 0-1 are Feature-Manifold (Y: Features, X: Nodes), Ch 2-6 are Spatial Cartography.
       * Horizontal flip applied to ALL channels (reverses 1D manifold / reflects 2D space).
-      * 2D Rotations & vertical flips applied to Spatial Cartography [3:] (preserving diffusion time arrow).
+      * 2D Rotations & vertical flips applied to Spatial Cartography [2:] (preserving feature axis).
+    - If 8 channels: Ch 0-2 are Spectral, Ch 3-7 are Spatial.
     - If 5 channels: Full D4 dihedral transformations applied to all channels.
+    - If 2 channels: Horizontal flip on node axis only.
     """
     bx = bx.clone()
     num_ch = bx.shape[1]
 
-    if num_ch == 8:
+    if num_ch == 7:
         # 1. Horizontal Flip: Valid for BOTH 1D node ordering and 2D spatial layout
         if random.random() > 0.5:
             bx = torch.flip(bx, dims=[-1])
 
-        # 2. 2D Rotations & Vertical Flips: Preserves diffusion time in Ch 0-2 while augmenting spatial Ch 3-7
+        # 2. 2D Rotations & Vertical Flips: Only on Spatial Cartography (Channels 2..6)
+        k = random.randint(0, 3)
+        if k > 0:
+            bx[:, 2:] = torch.rot90(bx[:, 2:], k=k, dims=[-2, -1])
+        if random.random() > 0.5:
+            bx[:, 2:] = torch.flip(bx[:, 2:], dims=[-2])
+
+        # 3. Spatial Jitter with Zero-Padding on Spatial Channels
+        if max_shift > 0 and random.random() > 0.5:
+            dy = random.randint(-max_shift, max_shift)
+            dx = random.randint(-max_shift, max_shift)
+            if dy != 0 or dx != 0:
+                bx[:, 2:] = torch.roll(bx[:, 2:], shifts=(dy, dx), dims=(-2, -1))
+                if dy > 0:
+                    bx[:, 2:, :dy, :] = 0.0
+                elif dy < 0:
+                    bx[:, 2:, dy:, :] = 0.0
+                if dx > 0:
+                    bx[:, 2:, :, :dx] = 0.0
+                elif dx < 0:
+                    bx[:, 2:, :, dx:] = 0.0
+
+        # 4. Topological Cutout on Spatial Channels
+        if cutout_prob > 0 and random.random() < cutout_prob:
+            h, w = bx.shape[-2], bx.shape[-1]
+            top = random.randint(0, max(0, h - cutout_size))
+            left = random.randint(0, max(0, w - cutout_size))
+            bx[:, 2:, top:top + cutout_size, left:left + cutout_size] = 0.0
+
+    elif num_ch == 8:
+        # Legacy 8-channel logic
+        if random.random() > 0.5:
+            bx = torch.flip(bx, dims=[-1])
         k = random.randint(0, 3)
         if k > 0:
             bx[:, 3:] = torch.rot90(bx[:, 3:], k=k, dims=[-2, -1])
         if random.random() > 0.5:
             bx[:, 3:] = torch.flip(bx[:, 3:], dims=[-2])
-
-        # 3. Spatial Jitter with Zero-Padding on Spatial Channels
         if max_shift > 0 and random.random() > 0.5:
             dy = random.randint(-max_shift, max_shift)
             dx = random.randint(-max_shift, max_shift)
@@ -188,13 +226,16 @@ def augment_graph_maps(bx: torch.Tensor, max_shift: int = 3, cutout_prob: float 
                     bx[:, 3:, :, :dx] = 0.0
                 elif dx < 0:
                     bx[:, 3:, :, dx:] = 0.0
-
-        # 4. Topological Cutout
         if cutout_prob > 0 and random.random() < cutout_prob:
             h, w = bx.shape[-2], bx.shape[-1]
             top = random.randint(0, max(0, h - cutout_size))
             left = random.randint(0, max(0, w - cutout_size))
-            bx[:, :, top:top + cutout_size, left:left + cutout_size] = 0.0
+            bx[:, 3:, top:top + cutout_size, left:left + cutout_size] = 0.0
+
+    elif num_ch == 2:
+        # Feature-Manifold only: horizontal flip of node axis
+        if random.random() > 0.5:
+            bx = torch.flip(bx, dims=[-1])
 
     else:
         # Standard purely spatial 5-channel map: Full D4 group
@@ -311,13 +352,26 @@ def main():
     parser.add_argument("--wd", type=float, default=1e-4, help="weight decay (default: 1e-4)")
     parser.add_argument("--res", type=int, default=64, help="canvas resolution (default: 64)")
     parser.add_argument("--layout", type=str, default="spring", choices=["spring", "spectral", "kamada_kawai"])
-    parser.add_argument("-c", "--channels", type=int, default=8, choices=[5, 8],
-                        help="channels: 8 (3 spectral + 5 spatial atlas) or 5 (spatial only) (default: 8)")
+    parser.add_argument("-c", "--channels", type=int, default=7, choices=[2, 5, 7, 8],
+                        help="channels: 7 (2 feature-manifold + 5 spatial atlas), 8 (legacy 3 spectral + 5 spatial), 5 (spatial only), or 2 (feature only) (default: 7)")
     parser.add_argument("--spatial_only", action="store_true", help="use 5-channel spatial cartography only")
+    parser.add_argument("--feature_only", action="store_true", help="use 2-channel feature manifold only")
     args = parser.parse_args()
 
-    include_spec = (args.channels == 8) and (not args.spatial_only)
-    mode_str = "8-Channel Master Atlas (3 Spectral + 5 Spatial)" if include_spec else "5-Channel Spatial Only"
+    if args.spatial_only:
+        channel_mode = "5ch"
+    elif args.feature_only:
+        channel_mode = "2ch"
+    else:
+        channel_mode = f"{args.channels}ch"
+
+    mode_titles = {
+        "7ch": "7-Channel Master Atlas (2 Feature-Manifold + 5 Spatial)",
+        "8ch": "8-Channel Legacy Atlas (3 Spectral + 5 Spatial)",
+        "5ch": "5-Channel Spatial Only",
+        "2ch": "2-Channel Feature-Manifold Only"
+    }
+    mode_str = mode_titles.get(channel_mode, f"{channel_mode} Atlas")
 
     print("=" * 80)
     print(f"Graph2Map 10-Fold Benchmark: {args.dataset} [{mode_str}]")
@@ -337,7 +391,7 @@ def main():
     # Load PyG dataset using the official GRDL benchmark loader
     dataset = load_dataset(args.dataset, args.seed)
     # Rasterize or load cached maps
-    X, Y = get_or_create_rasterized_maps(dataset, args.dataset, resolution=args.res, layout=args.layout, include_spectrogram=include_spec)
+    X, Y = get_or_create_rasterized_maps(dataset, args.dataset, resolution=args.res, layout=args.layout, channel_mode=channel_mode)
     num_classes = len(torch.unique(Y))
     num_samples = len(Y)
     in_channels = X.shape[1]

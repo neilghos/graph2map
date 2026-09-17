@@ -99,17 +99,26 @@ def main():
                         help="specific dataset to run (default: run all key benchmarks)")
     parser.add_argument("--all", action="store_true", help="run all 8 Table 1 benchmarks sequentially")
     parser.add_argument("--remaining", action="store_true", help="run the un-benchmarked datasets: BZR, PTC_MR, IMDB-MULTI, COLLAB")
-    parser.add_argument("-e", "--epoch", type=int, default=None, help="override epochs")
+    parser.add_argument("--featured", action="store_true", help="run all 5 featured benchmarks: MUTAG, BZR, PTC_MR, PROTEINS, NCI1")
+    parser.add_argument("-e", "--epoch", type=int, default=None, help="override epochs (e.g. 200)")
     parser.add_argument("-b", "--batch", type=int, default=None, help="override batch size")
-    parser.add_argument("-c", "--channels", type=int, default=None, choices=[5, 8], help="override channels (5 or 8)")
+    parser.add_argument("-c", "--channels", type=int, default=7, choices=[2, 5, 7, 8], help="override channels (default: 7 for Feature-Manifold Atlas)")
     parser.add_argument("--layout", type=str, default="spring", choices=["spring", "spectral", "kamada_kawai"])
     args = parser.parse_args()
 
     ALL_SUITE = ['MUTAG', 'PROTEINS', 'IMDB-BINARY', 'BZR', 'PTC_MR', 'IMDB-MULTI', 'NCI1', 'COLLAB']
+    FEATURED_SUITE = ['MUTAG', 'BZR', 'PTC_MR', 'PROTEINS', 'NCI1']
     REMAINING_SUITE = ['BZR', 'PTC_MR', 'IMDB-MULTI', 'COLLAB']
 
     if args.dataset:
         run_dataset(args.dataset, epochs=args.epoch, batch=args.batch, layout=args.layout, channels=args.channels)
+    elif args.featured:
+        print(f"[*] Running all 5 featured benchmarks: {FEATURED_SUITE} (Channels: {args.channels})")
+        for ds in FEATURED_SUITE:
+            rc = run_dataset(ds, epochs=args.epoch, batch=args.batch, layout=args.layout, channels=args.channels)
+            if rc != 0:
+                print(f"[!] Error occurred on {ds}, stopping suite.")
+                break
     elif args.remaining:
         print(f"[*] Running remaining benchmarks: {REMAINING_SUITE}")
         for ds in REMAINING_SUITE:
