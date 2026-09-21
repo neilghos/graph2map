@@ -12,7 +12,7 @@
 !**/*.py
 
 # Whitelist CSV files in results folder
-!results/*.csv
+!**/results/*.csv
 
 # Explicit exclusions for caches, temporary datasets, and compiled artifacts
 __pycache__/

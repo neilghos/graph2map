@@ -1,0 +1,6 @@
+dataset,mean_acc,std_acc,resolution,layout,epochs,batch_size,lr,time_sec
+MUTAG,97.34,3.55,64,spring,200,32,0.001,178.1
+PTC_MR,74.99,3.31,64,spring,200,32,0.001,339.4
+PROTEINS,78.34,2.72,64,spring,200,32,0.001,1041.1
+BZR,90.12,2.20,64,spring,200,32,0.001,438.0
+NCI1,83.28,1.74,64,spring,200,32,0.001,3321.
