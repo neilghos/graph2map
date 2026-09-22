@@ -16,7 +16,7 @@ from sklearn.model_selection import KFold
 from datetime import datetime
 
 from exp_util import load_dataset
-from expert_rasterizer import get_or_create_gcn_maps
+from expert_rasterizer import get_or_create_gcn_maps, get_or_create_expert_maps
 
 
 # =============================================================================
@@ -238,6 +238,7 @@ def train_and_eval_fold(
 
 def run_expert2map_benchmark(
     dataset_name: str = "PROTEINS",
+    expert: str = "gcn",
     epochs: int = 80,
     patience: int = 20,
     batch_size: int = 32,
@@ -250,7 +251,7 @@ def run_expert2map_benchmark(
     cache_dir: str = "./cache"
 ):
     print("=" * 80)
-    print(f"Graph2Map Single-Model GCN Baseline: {dataset_name}")
+    print(f"Graph2Map Single-Model Expert Baseline: {dataset_name} (Expert: {expert.upper()})")
     print(f"Resolution: {resolution}x{resolution} | Layout: {layout} | Epochs: {epochs} | Batch: {batch_size} | WD: {weight_decay} | Seed: {seed}")
     print("=" * 80)
 
@@ -274,10 +275,11 @@ def run_expert2map_benchmark(
     # Load dataset
     raw_dataset = load_dataset(dataset_name, seed=seed)
 
-    # Rasterize or load pre-rasterized GCN maps
-    X, Y = get_or_create_gcn_maps(
+    # Rasterize or load pre-rasterized expert maps
+    X, Y = get_or_create_expert_maps(
         dataset=raw_dataset,
         dataset_name=dataset_name,
+        expert=expert,
         resolution=resolution,
         layout=layout,
         cache_dir=cache_dir
@@ -292,7 +294,7 @@ def run_expert2map_benchmark(
     fold_final_train_accs = []
 
     print("\n" + "-" * 80)
-    print(f"Starting 10-Fold Cross-Validation on {dataset_name} ({num_samples} total graphs, 3 channels)...")
+    print(f"Starting 10-Fold Cross-Validation on {dataset_name} ({num_samples} total graphs, 3 {expert.upper()} channels)...")
     print("-" * 80)
 
     total_start = time.time()
@@ -343,7 +345,7 @@ def run_expert2map_benchmark(
     total_time = time.time() - total_start
 
     print("=" * 80)
-    print(f"GRAPH2MAP GCN BASELINE FINAL RESULTS ON {dataset_name} (10-Fold CV):")
+    print(f"GRAPH2MAP {expert.upper()} BASELINE FINAL RESULTS ON {dataset_name} (10-Fold CV):")
     print(f"  Validation Accuracy:   {mean_val:.2f}% ± {std_val:.2f}%")
     print(f"  All Valid Folds:       {[round(float(a), 2) for a in fold_val_arr]}")
     print(f"  Total Runtime:         {total_time:.1f}s")
@@ -362,7 +364,7 @@ def run_expert2map_benchmark(
         print("\nHead-to-Head Comparison with Published Baselines:")
         for name, score in published_baselines[dataset_name].items():
             print(f"  • {name:<28}: {score}")
-        print(f"  • Graph2Map GCN (Ours)       : {mean_val:.2f}% ± {std_val:.2f}%")
+        print(f"  • Graph2Map {expert.upper()} (Ours)       : {mean_val:.2f}% ± {std_val:.2f}%")
         print("=" * 80 + "\n")
 
     # Log to files
@@ -370,24 +372,26 @@ def run_expert2map_benchmark(
     log_path = "./results/expert2map_log.txt"
     with open(log_path, "a") as f:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"[{timestamp}] {dataset_name} (GCN-Map, Res {resolution}, WD {weight_decay}): {mean_val:.2f}% ± {std_val:.2f}% (Folds: {[round(float(a), 2) for a in fold_val_arr]})\n")
+        f.write(f"[{timestamp}] {dataset_name} ({expert.upper()}-Map, Res {resolution}, WD {weight_decay}): {mean_val:.2f}% ± {std_val:.2f}% (Folds: {[round(float(a), 2) for a in fold_val_arr]})\n")
 
     csv_path = "./results/expert2map_results.csv"
     file_exists = os.path.isfile(csv_path)
     with open(csv_path, "a") as f:
         if not file_exists:
             f.write("dataset,mean_acc,std_acc,resolution,layout,epochs,batch_size,lr,time_sec\n")
-        f.write(f"{dataset_name},{mean_val:.2f},{std_val:.2f},{resolution},{layout},{epochs},{batch_size},{lr},{total_time:.1f}\n")
+        f.write(f"{dataset_name} ({expert.upper()}),{mean_val:.2f},{std_val:.2f},{resolution},{layout},{epochs},{batch_size},{lr},{total_time:.1f}\n")
 
     print(f"[+] Logged results to {log_path} and {csv_path}")
     return mean_val, std_val
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Graph2Map Single-Model GCN Baseline")
-    parser.add_argument("-d", "--dataset", type=str, default="PROTEINS",
+    parser = argparse.ArgumentParser(description="Graph2Map Single-Model Expert Baseline")
+    parser.add_argument("-d", "--dataset", type=str, default="MUTAG",
                         choices=['MUTAG', 'PROTEINS', 'PTC_MR', 'NCI1', 'IMDB-BINARY', 'IMDB-MULTI', 'BZR', 'COLLAB'])
-    parser.add_argument("-e", "--epoch", type=int, default=200, help="epochs per fold (default: 80)")
+    parser.add_argument("--expert", type=str, default="gcn", choices=['gcn', 'gs', 'sage', 'lightgcn'], help="expert geometry: gcn, gs, lightgcn (default: gcn)")
+    parser.add_argument("--model", type=str, default=None, help="alias for --expert (e.g., GCN, GS, SAGE)")
+    parser.add_argument("-e", "--epoch", type=int, default=200, help="epochs per fold (default: 200)")
     parser.add_argument("--patience", type=int, default=0, help="early stopping patience (default: 20)")
     parser.add_argument("-b", "--batch", type=int, default=32, help="batch size (default: 32)")
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate (default: 1e-3)")
@@ -398,8 +402,13 @@ if __name__ == "__main__":
     parser.add_argument("-s", "--seed", type=int, default=123, help="random seed (default: 123)")
     args = parser.parse_args()
 
+    chosen_expert = (args.model if args.model is not None else args.expert).lower()
+    if chosen_expert == "sage":
+        chosen_expert = "gs"
+
     run_expert2map_benchmark(
         dataset_name=args.dataset,
+        expert=chosen_expert,
         epochs=args.epoch,
         patience=args.patience,
         batch_size=args.batch,
@@ -410,3 +419,4 @@ if __name__ == "__main__":
         layout=args.layout,
         seed=args.seed
     )
+

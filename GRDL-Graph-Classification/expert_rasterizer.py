@@ -227,43 +227,62 @@ def attach_gcn_embeddings(
     return dataset
 
 
-def get_or_create_gcn_maps(
+compute_expert_map = compute_gcn_map
+
+
+def get_or_create_expert_maps(
     dataset,
     dataset_name: str,
+    expert: str = "gcn",
     resolution: int = 64,
     layout: str = "spring",
     cache_dir: str = "./cache"
 ):
     """
-    Loads or pre-rasterizes all graphs in the dataset into 3-channel GCN heatmaps.
-    Saves cache to disk: cache/{dataset_name}_gcn_mote_res{resolution}_{layout}.pt
+    Loads or pre-rasterizes all graphs in the dataset into 3-channel heatmaps for the specified expert:
+      - 'gcn': Graph Convolutional Network (isotropic smoothing)
+      - 'gs': GraphSAGE (ego vs. neighborhood mean aggregation)
+      - 'lightgcn': Pure structural propagation
+    Saves cache to disk: cache/{dataset_name}_{expert}_mote_res{resolution}_{layout}.pt
     """
+    expert = expert.lower()
+    if expert == "sage":
+        expert = "gs"
     os.makedirs(cache_dir, exist_ok=True)
-    cache_path = os.path.join(cache_dir, f"{dataset_name}_gcn_mote_res{resolution}_{layout}.pt")
+    cache_path = os.path.join(cache_dir, f"{dataset_name}_{expert}_mote_res{resolution}_{layout}.pt")
 
     if os.path.exists(cache_path):
-        print(f"[*] Loading pre-rasterized GCN maps for {dataset_name} from: {cache_path}")
+        print(f"[*] Loading pre-rasterized {expert.upper()} maps for {dataset_name} from: {cache_path}")
         cache_data = torch.load(cache_path, weights_only=False)
         return cache_data['X'], cache_data['Y']
 
-    # Load pretrained GCN representations
-    emb_cache_path = os.path.join(cache_dir, f"{dataset_name}_gcn_dim64.pt")
+    # Load pretrained representations
+    emb_cache_path = os.path.join(cache_dir, f"{dataset_name}_{expert}_dim64.pt")
     if not os.path.exists(emb_cache_path):
-        print(f"[*] Pretrained GCN representations for {dataset_name} not found at {emb_cache_path}. Running pretrain_gcn now...")
-        from pretrain_gcn import pretrain_gcn
-        pretrain_gcn(dataset_name=dataset_name, epochs=200, embedding_dim=64, cache_dir=cache_dir)
+        print(f"[*] Pretrained {expert.upper()} representations for {dataset_name} not found at {emb_cache_path}. Running pretrainer...")
+        if expert == "gcn":
+            from pretrain_gcn import pretrain_gcn
+            pretrain_gcn(dataset_name=dataset_name, epochs=200, embedding_dim=64, cache_dir=cache_dir)
+        elif expert == "gs":
+            from pretrain_gs import pretrain_gs
+            pretrain_gs(dataset_name=dataset_name, epochs=200, embedding_dim=64, cache_dir=cache_dir)
+        elif expert == "lightgcn":
+            from pretrain_lightgcn import pretrain_lightgcn
+            pretrain_lightgcn(dataset_name=dataset_name, epochs=200, embedding_dim=64, cache_dir=cache_dir)
+        else:
+            raise ValueError(f"Unsupported expert: '{expert}'. Supported: 'gcn', 'gs', 'lightgcn'")
 
-    print(f"[*] Loading pretrained 64-dim GCN representations from: {emb_cache_path}")
+    print(f"[*] Loading pretrained 64-dim {expert.upper()} representations from: {emb_cache_path}")
     embeddings_list = torch.load(emb_cache_path, weights_only=False)
 
-    print(f"[*] Pre-rasterizing {len(dataset)} graphs for {dataset_name} (Resolution: {resolution}x{resolution}, Layout: {layout})...")
+    print(f"[*] Pre-rasterizing {len(dataset)} graphs for {dataset_name} ({expert.upper()} Maps, Resolution: {resolution}x{resolution}, Layout: {layout})...")
     start_t = time.time()
     maps_list = []
     labels_list = []
 
-    for idx, data in enumerate(tqdm(dataset, desc=f"Rasterizing GCN Maps: {dataset_name}", unit="graph")):
-        gcn_emb = embeddings_list[idx].float()
-        m = compute_gcn_map(data, gcn_emb, resolution=resolution, layout_method=layout, seed=42 + idx)
+    for idx, data in enumerate(tqdm(dataset, desc=f"Rasterizing {expert.upper()} Maps: {dataset_name}", unit="graph")):
+        emb = embeddings_list[idx].float()
+        m = compute_expert_map(data, emb, resolution=resolution, layout_method=layout, seed=42 + idx)
         maps_list.append(m)
         y_val = data.y.item() if hasattr(data.y, 'item') else int(data.y)
         labels_list.append(y_val)
@@ -280,3 +299,38 @@ def get_or_create_gcn_maps(
     torch.save({'X': X, 'Y': Y_norm}, cache_path)
     print(f"[+] Saved rasterized maps to: {cache_path}")
     return X, Y_norm
+
+
+def get_or_create_gcn_maps(
+    dataset,
+    dataset_name: str,
+    resolution: int = 64,
+    layout: str = "spring",
+    cache_dir: str = "./cache"
+):
+    return get_or_create_expert_maps(
+        dataset=dataset,
+        dataset_name=dataset_name,
+        expert="gcn",
+        resolution=resolution,
+        layout=layout,
+        cache_dir=cache_dir
+    )
+
+
+def get_or_create_gs_maps(
+    dataset,
+    dataset_name: str,
+    resolution: int = 64,
+    layout: str = "spring",
+    cache_dir: str = "./cache"
+):
+    return get_or_create_expert_maps(
+        dataset=dataset,
+        dataset_name=dataset_name,
+        expert="gs",
+        resolution=resolution,
+        layout=layout,
+        cache_dir=cache_dir
+    )
+
